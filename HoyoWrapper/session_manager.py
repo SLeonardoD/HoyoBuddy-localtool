@@ -1,29 +1,23 @@
 """
-session_manager.py
-------------------
-Punto de entrada principal de la librería simplificada de HoYoLab.
+HoyoWrapper/session_manager.py
+------------------------------
+Punto de entrada principal del wrapper.
 
-Orquesta el login, la detección de juegos y la creación de los objetos
-de juego correspondientes. Es lo único que el usuario final necesita importar.
-
-Cambios respecto a la versión anterior:
-  - checkin_all() añade delay aleatorio entre juegos (anti-detección).
-  - checkin_all() devuelve total_sign_day en el resultado (consistencia con
-    lo que claim_daily_reward() realmente retorna).
+Orquesta login, detección de juegos y creación de objetos de juego.
+Recibe CookieStore por inyección de dependencia (no importa db/).
 
 Uso típico:
-    from session_manager import HoyoManager
+    from db import CookieStore
+    from HoyoWrapper import HoyoManager
 
-    manager = HoyoManager()
+    store   = CookieStore("./hoyo_auth.db")
+    manager = HoyoManager(store)
     session = await manager.login("email@ejemplo.com", "contraseña")
 
     for game in session.games:
         print(game)
 
     results = await session.checkin_all()
-
-    for game in session.games:
-        tasks = await game.get_mimo_tasks()
 """
 
 from __future__ import annotations
@@ -31,39 +25,44 @@ from __future__ import annotations
 import logging
 import typing
 
-from auth_manager import AuthManager, HoyoSession, LoginError, HoyoAPIError
-from game_model import BaseGame, create_game, random_delay
+from HoyoWrapper.auth_manager import AuthManager
+from HoyoWrapper.game_model import BaseGame, create_game, random_delay
+from HoyoWrapper.session import HoyoAPIError, HoyoSession, LoginError
 
 __all__ = ["HoyoManager", "ActiveSession"]
 
 logger = logging.getLogger(__name__)
 
+# Juegos soportados por el wrapper
+_SUPPORTED_GAME_BIZ: frozenset[str] = frozenset({
+    "hk4e_global",  "hk4e_cn",
+    "hkrpg_global", "hkrpg_cn",
+    "nap_global",   "nap_cn",
+    "bh3_global",   "bh3_cn",
+})
+
 
 class ActiveSession:
     """
-    Sesión activa con los juegos del usuario ya detectados y listos.
+    Sesión activa con los juegos del usuario detectados y listos.
 
     Atributos:
         session      HoyoSession autenticada (cookies, region, device_id).
-        games        Lista de objetos BaseGame (uno por juego detectado).
-        raw_accounts Lista de dicts con los datos brutos de las cuentas.
+        games        Lista de BaseGame (uno por juego detectado).
+        raw_accounts Dicts brutos de las cuentas de juego.
     """
 
     def __init__(self, session: HoyoSession, accounts: list[dict]) -> None:
         self.session = session
         self.raw_accounts = accounts
-        self.games: list[BaseGame] = [
-            create_game(session, acc) for acc in accounts
-        ]
+        self.games: list[BaseGame] = [create_game(session, acc) for acc in accounts]
 
     @property
     def region(self) -> str:
-        """'os' o 'cn'."""
         return self.session.region
 
     @property
     def account_id(self) -> typing.Optional[int]:
-        """ID numérico de la cuenta HoYoLab."""
         return self.session.account_id
 
     def get_game(self, game_biz: str) -> typing.Optional[BaseGame]:
@@ -72,22 +71,21 @@ class ActiveSession:
 
     async def checkin_all(self) -> list[dict]:
         """
-        Realiza el check-in diario en todos los juegos detectados.
+        Check-in diario en todos los juegos detectados.
 
-        Incluye un delay aleatorio entre juegos (1-3s) para evitar patrones
-        de timing robótico que puedan activar sistemas anti-bot de HoYoverse.
+        Incluye delay aleatorio entre juegos (1–3s) para evitar patrones
+        de timing robótico que activen sistemas anti-bot de HoYoverse.
 
-        Devuelve lista de dicts con el resultado por juego:
+        Devuelve lista de dicts por juego:
             game_name       str
             uid             str
             success         bool
             message         str
             already_done    bool
-            total_sign_day  int     Días firmados este mes (0 si hubo error)
+            total_sign_day  int
         """
         results = []
         for i, game in enumerate(self.games):
-            # Delay entre juegos (no antes del primero)
             if i > 0:
                 await random_delay(1.0, 3.0)
 
@@ -111,45 +109,42 @@ class ActiveSession:
                     "total_sign_day": 0,
                 })
             except NotImplementedError:
-                pass  # Juego sin check-in implementado; ignorar silenciosamente
+                pass
 
         return results
 
     def __repr__(self) -> str:
-        game_names = [g.GAME_NAME for g in self.games]
         return (
             f"<ActiveSession region={self.region!r} "
             f"account_id={self.account_id} "
-            f"games={game_names}>"
+            f"games={[g.GAME_NAME for g in self.games]}>"
         )
 
 
 class HoyoManager:
     """
-    Punto de entrada principal de la librería.
+    Punto de entrada principal del wrapper.
 
     Parámetros:
-        db_path         Ruta al archivo SQLite. Por defecto './hoyo_auth.db'.
-        captcha_port    Puerto local para el servidor de captcha. Por defecto 5000.
-        lang            Idioma del widget Geetest ('en', 'es', 'zh-cn', ...).
+        store           CookieStore (inyectado — este objeto no crea la DB).
+        captcha_port    Puerto local del servidor de captcha. Por defecto 5000.
+        lang            Idioma del widget Geetest. Por defecto 'en'.
 
     Uso:
-        manager = HoyoManager()
+        from db import CookieStore
+        from HoyoWrapper import HoyoManager
+
+        manager = HoyoManager(CookieStore())
         session = await manager.login("email", "password")
-        print(session.games)
     """
 
     def __init__(
         self,
-        db_path: str = "./hoyo_auth.db",
+        store: typing.Any,          # CookieStore o compatible
         captcha_port: int = 5000,
         lang: str = "en",
     ) -> None:
-        self._auth = AuthManager(
-            db_path=db_path,
-            captcha_port=captcha_port,
-            lang=lang,
-        )
+        self._auth = AuthManager(store, captcha_port=captcha_port, lang=lang)
 
     async def login(
         self,
@@ -159,17 +154,12 @@ class HoyoManager:
         region: typing.Optional[typing.Literal["os", "cn"]] = None,
     ) -> ActiveSession:
         """
-        Autentica y devuelve una ActiveSession con los juegos del usuario listos.
+        Autentica y devuelve ActiveSession con los juegos del usuario listos.
 
-        Si ya hay cookies válidas en la DB no se necesita contraseña ni captcha.
-
-        Parámetros:
-            email       Email o usuario de HoYoLab / Miyoushe.
-            password    Contraseña.
-            region      'os' o 'cn'. Si no se indica, se detecta automáticamente.
+        Si hay cookies válidas en el store no se necesita contraseña ni captcha.
 
         Lanza:
-            LoginError  Si las credenciales son incorrectas.
+            LoginError  Credenciales incorrectas.
         """
         hoyo_session = await self._auth.login(email, password, region=region)
 
@@ -181,25 +171,12 @@ class HoyoManager:
         if not accounts:
             logger.warning("El usuario no tiene cuentas de juego vinculadas.")
 
-        _SUPPORTED = {
-            "hk4e_global", "hk4e_cn",
-            "hkrpg_global", "hkrpg_cn",
-            "nap_global", "nap_cn",
-            "bh3_global", "bh3_cn",
-        }
-        supported_accounts = [
-            acc for acc in accounts
-            if acc.get("game_biz", "") in _SUPPORTED
-        ]
+        supported = [acc for acc in accounts if acc.get("game_biz", "") in _SUPPORTED_GAME_BIZ]
+        logger.info("Detectados %d juego(s) para account_id=%s.",
+                    len(supported), hoyo_session.account_id)
 
-        logger.info(
-            "Detectados %d juego(s) para account_id=%s",
-            len(supported_accounts),
-            hoyo_session.account_id,
-        )
-
-        return ActiveSession(hoyo_session, supported_accounts)
+        return ActiveSession(hoyo_session, supported)
 
     async def logout(self, email: str) -> None:
-        """Elimina las cookies guardadas del usuario de la DB."""
+        """Elimina las cookies del usuario del store."""
         await self._auth.logout(email)

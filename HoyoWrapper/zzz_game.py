@@ -1,26 +1,18 @@
 """
-zzz_game.py
------------
-Módulo de Zenless Zone Zero.
-
-Hereda toda la lógica de BaseGame. Este archivo solo declara las constantes
-de identificación del juego.
+HoyoWrapper/zzz_game.py
+-----------------------
+Módulo de Zenless Zone Zero. Solo constantes; toda la lógica está en BaseGame.
 
 Particularidades respecto a Genshin:
-  - Mimo viajero: usa rutas estándar /<endpoint> (no /qiuqiu/).
-  - claim_mimo_task_reward: usa GET (no POST como Genshin).
-  - Canje de códigos: usa POST con webExchangeCdkeyRisk.
+  - Mimo: rutas estándar /<endpoint>, GET para claim_mimo_task_reward.
+  - Redeem: POST con webExchangeCdkeyRisk.
   - x-rpc-signgame: "zzz"
-  - Check-in URL específica: event/luna/zzz/os (distinta de HSR y Honkai).
-
-game_biz soportados:
-    nap_global    Zenless Zone Zero (región global, HoYoLab)
-    nap_cn        Zenless Zone Zero (región CN, Miyoushe)
+  - Check-in URL propia: event/luna/zzz/os (distinta de HSR y Honkai).
 """
 
 from __future__ import annotations
 
-from game_model import BaseGame
+from HoyoWrapper.game_model import BaseGame
 
 __all__ = ["ZZZGame"]
 
@@ -30,4 +22,4 @@ class ZZZGame(BaseGame):
 
     GAME_BIZ:  str = "nap_global"
     GAME_NAME: str = "Zenless Zone Zero"
-    GAME_ID:   int = 8  # ID mimo viajero
+    GAME_ID:   int = 8

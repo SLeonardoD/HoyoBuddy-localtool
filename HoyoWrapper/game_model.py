@@ -1,6 +1,6 @@
 """
-game_model.py
--------------
+HoyoWrapper/game_model.py
+-------------------------
 Clase base para todos los módulos de juego.
 
 Contiene la implementación real de check-in diario, mimo viajero y canje
@@ -8,22 +8,18 @@ de códigos. Las subclases solo necesitan declarar sus constantes de clase.
 
 Arquitectura:
   - BaseGame implementa toda la lógica compartida.
-  - Las subclases (GenshinGame, StarRailGame, etc.) son declarativas:
-    solo definen GAME_BIZ, GAME_NAME, GAME_ID.
+  - Las subclases son declarativas: solo definen GAME_BIZ, GAME_NAME, GAME_ID.
   - Escalar a un juego nuevo = crear un archivo con ~15 líneas de constantes.
 
-Medidas anti-detección implementadas:
-  - device_id tomado de HoyoSession (generado una vez en el login y
-    persistido en DB). Un dispositivo real siempre tiene el mismo ID.
-  - x-rpc-device_model en headers CN (igual que genshin.py).
-  - Retry automático con backoff exponencial + jitter ante rate limits
-    (tenacity). Retcodes -429 y HTTP 429 están cubiertos.
-  - Delays con jitter aleatorio entre operaciones múltiples para no
-    generar patrones de timing robótico.
+Medidas anti-detección:
+  - device_id tomado de HoyoSession (persistente desde el login).
+  - x-rpc-device_model en headers CN.
+  - Retry con backoff exponencial + jitter ante rate limits (tenacity).
+  - Delays aleatorios entre operaciones múltiples.
 
 Notas de compatibilidad:
   - HoyoSession.request() usa 'body' (no 'json') como parámetro del cuerpo.
-  - El mimo solo está disponible en región OS (HoYoLab). CN no lo soporta.
+  - El mimo solo está disponible en región OS. CN no lo soporta.
   - Honkai Impact 3rd no tiene mimo ni canje de códigos vía esta API.
 """
 
@@ -34,14 +30,13 @@ import logging
 import random
 import time
 import typing
-import uuid
 
 import tenacity
 
 if typing.TYPE_CHECKING:
-    from auth_manager import HoyoSession
+    from HoyoWrapper.session import HoyoSession
 
-from auth_manager import HoyoAPIError
+from HoyoWrapper.session import HoyoAPIError
 
 __all__ = [
     "BaseGame",
@@ -71,7 +66,6 @@ GAME_BIZ_MAP: dict[str, str] = {
     "nxx_cn":       "Tears of Themis (CN)",
 }
 
-# game_biz → mimo game_id. Honkai Impact 3rd no tiene mimo.
 GAME_ID_MAP: dict[str, int] = {
     "hk4e_global":  2,
     "hk4e_cn":      2,
@@ -81,8 +75,6 @@ GAME_ID_MAP: dict[str, int] = {
     "nap_cn":       8,
 }
 
-# Palabras clave para identificar monedas premium en la tienda mimo.
-# Búsqueda case-insensitive de subcadena.
 CURRENCY_ITEM_KEYWORDS: dict[str, list[str]] = {
     "hk4e_global":  ["genesis crystal", "genesis crystals"],
     "hk4e_cn":      ["创世结晶"],
@@ -95,10 +87,9 @@ CURRENCY_ITEM_KEYWORDS: dict[str, list[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# URLs base de los endpoints
+# URLs de endpoints
 # ---------------------------------------------------------------------------
 
-# Check-in diario. Fuente: genshin.py/genshin/client/routes.py (REWARD_URL).
 _REWARD_URLS: dict[str, str] = {
     "hk4e_global":  "https://sg-hk4e-api.hoyolab.com/event/sol",
     "hk4e_cn":      "https://api-takumi.mihoyo.com/event/bbs_sign_reward",
@@ -110,7 +101,6 @@ _REWARD_URLS: dict[str, str] = {
     "bh3_cn":       "https://api-takumi.mihoyo.com/event/luna",
 }
 
-# act_id requerido en check-in. Fuente: genshin.py/genshin/client/routes.py.
 _ACT_IDS: dict[str, str] = {
     "hk4e_global":  "e202102251931481",
     "hk4e_cn":      "e202009291139501",
@@ -122,7 +112,6 @@ _ACT_IDS: dict[str, str] = {
     "bh3_cn":       "e202110291205111",
 }
 
-# x-rpc-signgame por juego. Fuente: genshin.py/daily.py.
 _SIGNGAME: dict[str, str] = {
     "hk4e_global":  "hk4e",
     "hk4e_cn":      "hk4e",
@@ -134,27 +123,21 @@ _SIGNGAME: dict[str, str] = {
     "bh3_cn":       "bh3",
 }
 
-# URLs de canje de códigos. Fuente: genshin.py/genshin/client/routes.py.
 _CODE_URLS: dict[str, str] = {
     "hk4e_global":  "https://sg-hk4e-api.hoyoverse.com/common/apicdkey/api/webExchangeCdkey",
     "hkrpg_global": "https://sg-public-api.hoyoverse.com/common/apicdkey/api/webExchangeCdkeyRisk",
     "nap_global":   "https://public-operation-nap.hoyoverse.com/common/apicdkey/api/webExchangeCdkeyRisk",
 }
 
-# StarRail y ZZZ usan POST para redeem; Genshin usa GET.
 _CODE_POST_GAMES: frozenset[str] = frozenset({"hkrpg_global", "nap_global"})
 
-# Origin/Referer para redeem por juego.
 _CODE_ORIGINS: dict[str, str] = {
     "hk4e_global":  "https://genshin.hoyoverse.com",
     "hkrpg_global": "https://hsr.hoyoverse.com",
     "nap_global":   "https://zenless.hoyoverse.com",
 }
 
-# URL base del mimo viajero (solo OS).
 _MIMO_BASE_URL = "https://sg-public-api.hoyolab.com/event/miyoubi"
-
-# DS salt para CN. Fuente: genshin.py/genshin/constants.py.
 _DS_SALT_CN_SIGNIN = "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs"
 
 # ---------------------------------------------------------------------------
@@ -163,23 +146,16 @@ _DS_SALT_CN_SIGNIN = "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs"
 
 async def random_delay(min_s: float = 1.0, max_s: float = 3.0) -> None:
     """
-    Espera un tiempo aleatorio entre min_s y max_s segundos.
-
-    Uso entre operaciones secuenciales (check-in de varios juegos, compras
-    en mimo) para evitar patrones de timing robótico que disparen los
-    sistemas anti-bot de HoYoverse.
+    Espera aleatoria entre operaciones para evitar patrones de timing robótico.
+    Exportada para que session_manager pueda usarla en checkin_all().
     """
     delay = random.uniform(min_s, max_s)
-    logger.debug("Anti-detección: esperando %.2fs antes del siguiente request.", delay)
+    logger.debug("Anti-detección: delay de %.2fs.", delay)
     await asyncio.sleep(delay)
 
 
 def _is_rate_limit(exc: BaseException) -> bool:
-    """
-    Devuelve True si la excepción corresponde a un rate limit de HoYoverse.
-
-    Cubre retcode -429 (HoYoAPIError) y HTTP 429 (aiohttp.ClientResponseError).
-    """
+    """True si la excepción es un rate limit de HoYoverse (retcode -429 o HTTP 429)."""
     if isinstance(exc, HoyoAPIError) and exc.retcode in (-429, 429):
         return True
     try:
@@ -191,9 +167,6 @@ def _is_rate_limit(exc: BaseException) -> bool:
     return False
 
 
-# Decorador de retry reutilizable: backoff exponencial con jitter completo.
-# Cubre rate limits y errores de red transitorios.
-# Se aplica en _get/_post mediante tenacity.retry().
 _RETRY_KWARGS = dict(
     retry=tenacity.retry_if_exception(_is_rate_limit),
     wait=tenacity.wait_random_exponential(multiplier=2, min=5, max=60),
@@ -201,7 +174,6 @@ _RETRY_KWARGS = dict(
     before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-
 
 # ---------------------------------------------------------------------------
 # Clase base
@@ -211,13 +183,12 @@ class BaseGame:
     """
     Clase base para los módulos de juego.
 
-    Implementa la lógica completa de check-in, mimo y redeem.
-    Las subclases solo declaran: GAME_BIZ, GAME_NAME, GAME_ID.
+    Implementa check-in, mimo y redeem. Las subclases declaran solo:
+        GAME_BIZ, GAME_NAME, GAME_ID
 
     Parámetros:
-        session     HoyoSession autenticada (incluye device_id persistente).
-        account     Dict devuelto por HoyoSession.get_game_accounts():
-                        game_biz, game_uid, nickname, level, region, region_name
+        session     HoyoSession autenticada (contiene device_id persistente).
+        account     Dict de HoyoSession.get_game_accounts().
     """
 
     GAME_BIZ:  str = ""
@@ -230,7 +201,7 @@ class BaseGame:
         self._mimo_version_id: typing.Optional[int] = None
 
     # ------------------------------------------------------------------
-    # Propiedades de conveniencia
+    # Propiedades
     # ------------------------------------------------------------------
 
     @property
@@ -274,7 +245,7 @@ class BaseGame:
         return _SIGNGAME.get(self.game_biz, "")
 
     # ------------------------------------------------------------------
-    # Métodos HTTP internos con retry automático
+    # HTTP interno con retry
     # ------------------------------------------------------------------
 
     async def _get(
@@ -297,9 +268,7 @@ class BaseGame:
         headers: typing.Optional[dict] = None,
     ) -> typing.Any:
         """POST autenticado con retry ante rate limits.
-
-        Usa 'body' en lugar de 'json' porque HoyoSession.request() así lo
-        requiere por diseño (evita shadowing del módulo json).
+        Usa 'body' porque HoyoSession.request() así lo requiere.
         """
         @tenacity.retry(**_RETRY_KWARGS)
         async def _inner() -> typing.Any:
@@ -314,30 +283,23 @@ class BaseGame:
 
     def _checkin_headers(self) -> dict:
         """
-        Headers para los endpoints de check-in según región.
-
-        OS:  x-rpc-signgame + Referer.
-        CN:  Además, headers de device info que reducen captchas Geetest.
-             device_id tomado de HoyoSession (persistente, generado en login)
-             para simular siempre el mismo dispositivo.
+        Headers de check-in según región.
+        CN usa device_id de la sesión (persistente) para simular mismo dispositivo.
         """
         headers: dict[str, str] = {"x-rpc-signgame": self._signgame}
 
         if not self.is_chinese_region:
             headers["Referer"] = "https://act.hoyolab.com/"
         else:
-            # device_id consistente con el del login → mismo "dispositivo"
             headers.update({
-                "x-rpc-app_version": "2.70.1",
-                "x-rpc-client_type": "5",
-                "x-rpc-device_id":   self.session.device_id,
-                "x-rpc-sys_version": "12",
-                "x-rpc-platform":    "android",
-                "x-rpc-channel":     "miyousheluodi",
-                # account_id como device_model, igual que genshin.py
+                "x-rpc-app_version":  "2.70.1",
+                "x-rpc-client_type":  "5",
+                "x-rpc-device_id":    self.session.device_id,
+                "x-rpc-sys_version":  "12",
+                "x-rpc-platform":     "android",
+                "x-rpc-channel":      "miyousheluodi",
                 "x-rpc-device_model": str(self.session.account_id or ""),
             })
-            # DS dinámico opcional para CN.
             try:
                 from _ds_utility import generate_dynamic_secret  # type: ignore[import]
                 headers["ds"] = generate_dynamic_secret(_DS_SALT_CN_SIGNIN)
@@ -347,7 +309,6 @@ class BaseGame:
         return headers
 
     def _checkin_params(self, lang: str = "en") -> dict:
-        """Query params para /info y /sign del check-in."""
         params: dict[str, typing.Any] = {"act_id": self._act_id}
         if not self.is_chinese_region:
             params["lang"] = lang
@@ -358,11 +319,11 @@ class BaseGame:
 
     async def get_daily_reward_info(self, *, lang: str = "en") -> dict:
         """
-        Estado del check-in diario del usuario.
+        Estado del check-in diario.
 
         Devuelve:
-            is_sign         bool    True si ya se hizo check-in hoy.
-            total_sign_day  int     Días totales firmados este mes.
+            is_sign         bool
+            total_sign_day  int
         """
         data = await self._get(
             f"{self._reward_base_url}/info",
@@ -376,28 +337,21 @@ class BaseGame:
 
     async def claim_daily_reward(self, *, lang: str = "en") -> dict:
         """
-        Realiza el check-in diario si no se ha hecho aún hoy.
+        Realiza el check-in diario si no se ha hecho aún.
 
         Devuelve:
-            message         str     Mensaje de resultado legible.
-            already_done    bool    True si el check-in ya estaba hecho.
-            total_sign_day  int     Días totales firmados este mes.
-
-        Lanza:
-            HoyoAPIError    Si la API devuelve un error inesperado.
+            message         str
+            already_done    bool
+            total_sign_day  int
         """
         info = await self.get_daily_reward_info(lang=lang)
 
         if info["is_sign"]:
-            logger.info(
-                "[%s] uid=%s ya hizo check-in hoy (día %d del mes).",
-                self.GAME_NAME, self.uid, info["total_sign_day"],
-            )
-            return {
-                "message":        "Check-in ya realizado hoy.",
-                "already_done":   True,
-                "total_sign_day": info["total_sign_day"],
-            }
+            logger.info("[%s] uid=%s ya hizo check-in hoy (día %d).",
+                        self.GAME_NAME, self.uid, info["total_sign_day"])
+            return {"message": "Check-in ya realizado hoy.",
+                    "already_done": True,
+                    "total_sign_day": info["total_sign_day"]}
 
         await self._post(
             f"{self._reward_base_url}/sign",
@@ -406,54 +360,28 @@ class BaseGame:
         )
 
         info_after = await self.get_daily_reward_info(lang=lang)
-        logger.info(
-            "[%s] uid=%s Check-in realizado (día %d del mes).",
-            self.GAME_NAME, self.uid, info_after["total_sign_day"],
-        )
-        return {
-            "message":        "Check-in realizado.",
-            "already_done":   False,
-            "total_sign_day": info_after["total_sign_day"],
-        }
+        logger.info("[%s] uid=%s Check-in realizado (día %d).",
+                    self.GAME_NAME, self.uid, info_after["total_sign_day"])
+        return {"message": "Check-in realizado.",
+                "already_done": False,
+                "total_sign_day": info_after["total_sign_day"]}
 
     # ------------------------------------------------------------------
-    # Mimo viajero (solo OS, solo juegos con GAME_ID > 0)
+    # Mimo viajero
     # ------------------------------------------------------------------
 
     def _check_mimo_support(self) -> None:
-        """Lanza NotImplementedError si este juego/región no soporta mimo."""
         if self.GAME_ID == 0:
-            raise NotImplementedError(
-                f"{self.GAME_NAME} no tiene soporte de Mimo Viajero."
-            )
+            raise NotImplementedError(f"{self.GAME_NAME} no tiene soporte de Mimo Viajero.")
         if self.is_chinese_region:
-            raise NotImplementedError(
-                "El Mimo Viajero solo está disponible en región OS (HoYoLab)."
-            )
+            raise NotImplementedError("El Mimo Viajero solo está disponible en región OS.")
 
     def _mimo_url(self, endpoint: str) -> str:
-        """
-        URL del endpoint mimo según el juego.
-
-        Genshin (GAME_ID=2): /qiuqiu/<endpoint> con guiones→guiones_bajos.
-        Resto: /<endpoint> directamente.
-        Documentado en genshin.py/hoyolab.py/_request_mimo.
-        """
         if self.GAME_ID == 2:
             return f"{_MIMO_BASE_URL}/qiuqiu/{endpoint.replace('-', '_')}"
         return f"{_MIMO_BASE_URL}/{endpoint}"
 
     async def _get_mimo_version_id(self) -> int:
-        """
-        Obtiene el version_id activo del mimo para este juego.
-
-        Dinámico (cambia cada temporada). Cacheado en la instancia.
-
-        Estrategia de parsing:
-          Genshin:  data["act_list"][N]["act_info"]
-          HSR/ZZZ:  data["list"][N]
-          Identificador del juego puede ser "game" o "game_id"; se prueban ambos.
-        """
         if self._mimo_version_id is not None:
             return self._mimo_version_id
 
@@ -463,52 +391,30 @@ class BaseGame:
         )
 
         if self.GAME_ID == 2:
-            items = [
-                item["act_info"]
-                for item in data.get("act_list", [])
-                if "act_info" in item
-            ]
+            items = [i["act_info"] for i in data.get("act_list", []) if "act_info" in i]
         else:
             items = data.get("list", [])
 
         if not items:
-            raise HoyoAPIError(
-                0, f"Mimo: respuesta vacía al obtener index (game_id={self.GAME_ID})", data
-            )
+            raise HoyoAPIError(0, f"Mimo: respuesta vacía (game_id={self.GAME_ID})", data)
 
         entry = next(
-            (
-                i for i in items
-                if i.get("game_id") == self.GAME_ID or i.get("game") == self.GAME_ID
-            ),
+            (i for i in items if i.get("game_id") == self.GAME_ID or i.get("game") == self.GAME_ID),
             items[0],
         )
-
         if entry is items[0] and len(items) > 1:
-            logger.debug(
-                "Mimo: sin coincidencia exacta de game_id=%d en %d items, usando el primero.",
-                self.GAME_ID, len(items),
-            )
+            logger.debug("Mimo: sin coincidencia exacta game_id=%d, usando primer item.", self.GAME_ID)
 
         version_id = entry.get("version_id") or entry.get("id")
         if not version_id:
-            raise HoyoAPIError(
-                0,
-                f"Mimo: version_id no encontrado en la entrada del índice: {entry}",
-                data,
-            )
+            raise HoyoAPIError(0, f"Mimo: version_id no encontrado en: {entry}", data)
 
         self._mimo_version_id = int(version_id)
         logger.debug("[%s] Mimo version_id=%d.", self.GAME_NAME, self._mimo_version_id)
         return self._mimo_version_id
 
     async def get_mimo_tasks(self, *, lang: str = "en") -> list[dict]:
-        """
-        Lista de tareas del mimo viajero.
-
-        Campos relevantes:
-            task_id, name, point, status (0=pendiente, 1=completada, 2=reclamada)
-        """
+        """Tareas del mimo. Campos: task_id, name, point, status."""
         self._check_mimo_support()
         version_id = await self._get_mimo_version_id()
         data = await self._get(
@@ -518,31 +424,18 @@ class BaseGame:
         return data.get("task_list", [])
 
     async def claim_mimo_task_reward(self, task_id: int, *, lang: str = "en") -> None:
-        """
-        Reclama la recompensa de una tarea del mimo completada.
-
-        Genshin usa POST; el resto usa GET.
-        Documentado en genshin.py/hoyolab.py/claim_mimo_task_reward.
-        """
+        """Reclama recompensa de tarea mimo. Genshin usa POST; resto usa GET."""
         self._check_mimo_support()
         version_id = await self._get_mimo_version_id()
-        params = {
-            "task_id":    task_id,
-            "game_id":    self.GAME_ID,
-            "lang":       lang,
-            "version_id": version_id,
-        }
+        params = {"task_id": task_id, "game_id": self.GAME_ID,
+                  "lang": lang, "version_id": version_id}
         if self.GAME_ID == 2:
             await self._post(self._mimo_url("receive-point"), params=params)
         else:
             await self._get(self._mimo_url("receive-point"), params=params)
 
     async def get_mimo_shop_items(self, *, lang: str = "en") -> list[dict]:
-        """
-        Items disponibles en la tienda del mimo viajero.
-
-        Campos relevantes: award_id, name, cost.
-        """
+        """Items de la tienda mimo. Campos: award_id, name, cost."""
         self._check_mimo_support()
         version_id = await self._get_mimo_version_id()
         data = await self._get(
@@ -553,22 +446,15 @@ class BaseGame:
 
     async def buy_mimo_currency(self, *, lang: str = "en") -> list[dict]:
         """
-        Compra automáticamente las monedas premium del juego en la tienda mimo.
+        Compra monedas premium en la tienda mimo.
+        Incluye delay entre compras para evitar patrones robóticos.
 
-        Filtra por CURRENCY_ITEM_KEYWORDS[game_biz] (case-insensitive, subcadena).
-        Incluye delay aleatorio entre compras para evitar patrones robóticos.
-
-        Devuelve lista de compras realizadas:
-            item_name   str     Nombre del item comprado
-            code        str     Código regalo resultante para canjear
+        Devuelve: [{item_name, code}, ...]
         """
         self._check_mimo_support()
         keywords = CURRENCY_ITEM_KEYWORDS.get(self.game_biz, [])
         if not keywords:
-            logger.warning(
-                "[%s] No hay keywords de moneda definidas para %s.",
-                self.GAME_NAME, self.game_biz,
-            )
+            logger.warning("[%s] Sin keywords de moneda para %s.", self.GAME_NAME, self.game_biz)
             return []
 
         items = await self.get_mimo_shop_items(lang=lang)
@@ -584,7 +470,6 @@ class BaseGame:
             if not award_id:
                 continue
 
-            # Delay entre compras (no antes de la primera)
             if not first:
                 await random_delay(1.5, 4.0)
             first = False
@@ -592,51 +477,33 @@ class BaseGame:
             try:
                 data = await self._post(
                     self._mimo_url("exchange"),
-                    data={
-                        "award_id":   award_id,
-                        "game_id":    self.GAME_ID,
-                        "lang":       lang,
-                        "version_id": version_id,
-                    },
+                    data={"award_id": award_id, "game_id": self.GAME_ID,
+                          "lang": lang, "version_id": version_id},
                 )
                 code = data.get("exchange_code", "")
-                logger.info(
-                    "[%s] Comprado '%s' en mimo → código: %s",
-                    self.GAME_NAME, item.get("name"), code,
-                )
+                logger.info("[%s] Comprado '%s' → código: %s",
+                            self.GAME_NAME, item.get("name"), code)
                 results.append({"item_name": item.get("name"), "code": code})
             except HoyoAPIError as e:
-                logger.warning(
-                    "[%s] Error al comprar '%s' en mimo: %s",
-                    self.GAME_NAME, item.get("name"), e,
-                )
+                logger.warning("[%s] Error comprando '%s': %s",
+                               self.GAME_NAME, item.get("name"), e)
 
         return results
 
     # ------------------------------------------------------------------
-    # Canje de códigos regalo
+    # Canje de códigos
     # ------------------------------------------------------------------
 
     async def redeem_code(self, code: str, *, lang: str = "en") -> None:
         """
-        Canjea un código regalo para este juego.
-
-        Disponible solo en OS: Genshin (GET), StarRail (POST), ZZZ (POST).
-        Honkai Impact 3rd no tiene este endpoint en la API pública.
-
-        Lanza:
-            NotImplementedError  Si el juego o región no soportan redeem.
-            HoyoAPIError         Si el código es inválido, ya fue usado, etc.
+        Canjea un código regalo. OS únicamente.
+        Genshin: GET. StarRail/ZZZ: POST. Honkai: no soportado.
         """
         base_url = _CODE_URLS.get(self.game_biz)
         if not base_url:
-            raise NotImplementedError(
-                f"{self.GAME_NAME} no soporta canje de códigos vía esta API."
-            )
+            raise NotImplementedError(f"{self.GAME_NAME} no soporta canje de códigos.")
         if self.is_chinese_region:
-            raise NotImplementedError(
-                "El canje de códigos vía API solo está disponible en región OS."
-            )
+            raise NotImplementedError("El canje de códigos solo está disponible en OS.")
 
         lang_short = lang[:2] if len(lang) > 2 else lang
         origin = _CODE_ORIGINS.get(self.game_biz, "https://hoyoverse.com")
@@ -660,13 +527,8 @@ class BaseGame:
         else:
             await self._get(
                 base_url,
-                params={
-                    "uid":      self.uid,
-                    "region":   self.server,
-                    "lang":     lang_short,
-                    "cdkey":    code,
-                    "game_biz": self.game_biz,
-                },
+                params={"uid": self.uid, "region": self.server,
+                        "lang": lang_short, "cdkey": code, "game_biz": self.game_biz},
                 headers=headers,
             )
 
@@ -677,13 +539,8 @@ class BaseGame:
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
-        return (
-            f"<{self.__class__.__name__} "
-            f"uid={self.uid} "
-            f"nickname={self.nickname!r} "
-            f"level={self.level} "
-            f"server={self.server!r}>"
-        )
+        return (f"<{self.__class__.__name__} uid={self.uid} "
+                f"nickname={self.nickname!r} level={self.level} server={self.server!r}>")
 
 
 # ---------------------------------------------------------------------------
@@ -691,16 +548,11 @@ class BaseGame:
 # ---------------------------------------------------------------------------
 
 def create_game(session: "HoyoSession", account: dict) -> "BaseGame":
-    """
-    Instancia la subclase correcta de BaseGame según el game_biz de la cuenta.
-
-    Imports locales para evitar circulares (todas las subclases importan game_model).
-    Si el game_biz no está en el registro, devuelve un BaseGame genérico.
-    """
-    from genshin_game import GenshinGame    # noqa: PLC0415
-    from starrail_game import StarRailGame  # noqa: PLC0415
-    from zzz_game import ZZZGame            # noqa: PLC0415
-    from honkai_game import HonkaiGame      # noqa: PLC0415
+    """Instancia la subclase correcta según game_biz. Imports locales = sin circulares."""
+    from HoyoWrapper.genshin_game import GenshinGame    # noqa: PLC0415
+    from HoyoWrapper.starrail_game import StarRailGame  # noqa: PLC0415
+    from HoyoWrapper.zzz_game import ZZZGame            # noqa: PLC0415
+    from HoyoWrapper.honkai_game import HonkaiGame      # noqa: PLC0415
 
     _REGISTRY: dict[str, type[BaseGame]] = {
         "hk4e_global":  GenshinGame,
@@ -712,6 +564,5 @@ def create_game(session: "HoyoSession", account: dict) -> "BaseGame":
         "bh3_global":   HonkaiGame,
         "bh3_cn":       HonkaiGame,
     }
-
     cls = _REGISTRY.get(account.get("game_biz", ""), BaseGame)
     return cls(session, account)
