@@ -6,23 +6,24 @@ Punto de entrada principal de la librería simplificada de HoYoLab.
 Orquesta el login, la detección de juegos y la creación de los objetos
 de juego correspondientes. Es lo único que el usuario final necesita importar.
 
+Cambios respecto a la versión anterior:
+  - checkin_all() añade delay aleatorio entre juegos (anti-detección).
+  - checkin_all() devuelve total_sign_day en el resultado (consistencia con
+    lo que claim_daily_reward() realmente retorna).
+
 Uso típico:
     from session_manager import HoyoManager
 
     manager = HoyoManager()
     session = await manager.login("email@ejemplo.com", "contraseña")
 
-    # Ver qué juegos tiene el usuario
     for game in session.games:
         print(game)
 
-    # Hacer check-in diario en todos los juegos detectados
     results = await session.checkin_all()
 
-    # Tareas y tienda del mimo viajero
     for game in session.games:
         tasks = await game.get_mimo_tasks()
-        ...
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import logging
 import typing
 
 from auth_manager import AuthManager, HoyoSession, LoginError, HoyoAPIError
-from game_model import BaseGame, create_game
+from game_model import BaseGame, create_game, random_delay
 
 __all__ = ["HoyoManager", "ActiveSession"]
 
@@ -43,8 +44,8 @@ class ActiveSession:
     Sesión activa con los juegos del usuario ya detectados y listos.
 
     Atributos:
-        session     HoyoSession autenticada (cookies, region).
-        games       Lista de objetos BaseGame (uno por juego detectado).
+        session      HoyoSession autenticada (cookies, region, device_id).
+        games        Lista de objetos BaseGame (uno por juego detectado).
         raw_accounts Lista de dicts con los datos brutos de las cuentas.
     """
 
@@ -73,34 +74,45 @@ class ActiveSession:
         """
         Realiza el check-in diario en todos los juegos detectados.
 
+        Incluye un delay aleatorio entre juegos (1-3s) para evitar patrones
+        de timing robótico que puedan activar sistemas anti-bot de HoYoverse.
+
         Devuelve lista de dicts con el resultado por juego:
-            game_name   str
-            uid         str
-            success     bool
-            message     str
-            reward      dict | None   (el reward del día si se reclamó)
+            game_name       str
+            uid             str
+            success         bool
+            message         str
+            already_done    bool
+            total_sign_day  int     Días firmados este mes (0 si hubo error)
         """
         results = []
-        for game in self.games:
+        for i, game in enumerate(self.games):
+            # Delay entre juegos (no antes del primero)
+            if i > 0:
+                await random_delay(1.0, 3.0)
+
             try:
                 result = await game.claim_daily_reward()
                 results.append({
-                    "game_name": game.GAME_NAME,
-                    "uid": game.uid,
-                    "success": True,
-                    "message": result.get("message", "Check-in realizado."),
-                    "reward": result.get("reward"),
+                    "game_name":      game.GAME_NAME,
+                    "uid":            game.uid,
+                    "success":        True,
+                    "message":        result.get("message", "Check-in realizado."),
+                    "already_done":   result.get("already_done", False),
+                    "total_sign_day": result.get("total_sign_day", 0),
                 })
             except HoyoAPIError as e:
                 results.append({
-                    "game_name": game.GAME_NAME,
-                    "uid": game.uid,
-                    "success": False,
-                    "message": str(e),
-                    "reward": None,
+                    "game_name":      game.GAME_NAME,
+                    "uid":            game.uid,
+                    "success":        False,
+                    "message":        str(e),
+                    "already_done":   False,
+                    "total_sign_day": 0,
                 })
             except NotImplementedError:
-                pass  # Juego no soportado aún
+                pass  # Juego sin check-in implementado; ignorar silenciosamente
+
         return results
 
     def __repr__(self) -> str:
@@ -114,7 +126,7 @@ class ActiveSession:
 
 class HoyoManager:
     """
-    Punto de entrada principal.
+    Punto de entrada principal de la librería.
 
     Parámetros:
         db_path         Ruta al archivo SQLite. Por defecto './hoyo_auth.db'.
@@ -149,8 +161,7 @@ class HoyoManager:
         """
         Autentica y devuelve una ActiveSession con los juegos del usuario listos.
 
-        Si ya hay cookies guardadas en la DB y siguen siendo válidas,
-        no se necesita contraseña ni captcha.
+        Si ya hay cookies válidas en la DB no se necesita contraseña ni captcha.
 
         Parámetros:
             email       Email o usuario de HoYoLab / Miyoushe.
@@ -160,10 +171,8 @@ class HoyoManager:
         Lanza:
             LoginError  Si las credenciales son incorrectas.
         """
-        # 1. Autenticar y obtener sesión con cookies
         hoyo_session = await self._auth.login(email, password, region=region)
 
-        # 2. Detectar qué juegos tiene el usuario
         try:
             accounts = await hoyo_session.get_game_accounts()
         except HoyoAPIError as e:
@@ -172,7 +181,6 @@ class HoyoManager:
         if not accounts:
             logger.warning("El usuario no tiene cuentas de juego vinculadas.")
 
-        # 3. Filtrar solo los game_biz que tienen soporte implementado
         _SUPPORTED = {
             "hk4e_global", "hk4e_cn",
             "hkrpg_global", "hkrpg_cn",

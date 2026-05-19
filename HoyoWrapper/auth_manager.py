@@ -21,6 +21,10 @@ Correcciones respecto a la versión anterior:
             para no shadowear el módulo json importado.
   - Bug 3: manejo del retcode -3239 (verificación de email) implementado
             en _os_login_flow() con solicitud del código por consola.
+  - Anti-detección 1: _USER_AGENT actualizado a Chrome 124 (2024).
+  - Anti-detección 2: device_id generado una vez por sesión de login y
+            almacenado en HoyoSession para reutilizarse en requests
+            posteriores (check-in CN, etc.), simulando un dispositivo real.
 """
 
 from __future__ import annotations
@@ -47,10 +51,12 @@ logger = logging.getLogger(__name__)
 # Constantes
 # ---------------------------------------------------------------------------
 
+# UA moderno (Chrome 124, Windows 10, mayo 2024).
+# Un UA desactualizado es señal inmediata de bot para los sistemas de HoYoverse.
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/58.0.3029.110 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 # URLs de autenticación (copiadas de genshin.py/genshin/client/routes.py)
@@ -101,33 +107,33 @@ AQAB
 
 # Headers base para login web OS (copiados de genshin.py/genshin/utility/auth.py)
 _WEB_LOGIN_HEADERS: dict[str, str] = {
-    "x-rpc-app_id": "c9oqaq3s3gu8",
+    "x-rpc-app_id":      "c9oqaq3s3gu8",
     "x-rpc-client_type": "4",
     "x-rpc-app_version": "2.55.0",
-    "Origin": "https://account.hoyolab.com",
-    "Referer": "https://account.hoyolab.com/",
-    "Content-Type": "application/json",
-    "User-Agent": _USER_AGENT,
+    "Origin":            "https://account.hoyolab.com",
+    "Referer":           "https://account.hoyolab.com/",
+    "Content-Type":      "application/json",
+    "User-Agent":        _USER_AGENT,
 }
 
 # Headers base para login web CN (copiados de genshin.py/genshin/utility/auth.py)
 _CN_LOGIN_HEADERS: dict[str, str] = {
-    "x-rpc-app_id": "bll8iq97cem8",
+    "x-rpc-app_id":      "bll8iq97cem8",
     "x-rpc-client_type": "4",
     "x-rpc-app_version": "2.55.0",
-    "Origin": "https://user.mihoyo.com",
-    "Referer": "https://user.mihoyo.com/",
-    "Content-Type": "application/json",
-    "User-Agent": _USER_AGENT,
+    "Origin":            "https://user.mihoyo.com",
+    "Referer":           "https://user.mihoyo.com/",
+    "Content-Type":      "application/json",
+    "User-Agent":        _USER_AGENT,
 }
 
 # Headers para enviar/verificar código de email
 _EMAIL_SEND_HEADERS: dict[str, str] = {
-    "x-rpc-app_id": "c9oqaq3s3gu8",
+    "x-rpc-app_id":      "c9oqaq3s3gu8",
     "x-rpc-client_type": "4",
     "x-rpc-app_version": "2.55.0",
-    "Content-Type": "application/json",
-    "User-Agent": _USER_AGENT,
+    "Content-Type":      "application/json",
+    "User-Agent":        _USER_AGENT,
 }
 
 _EMAIL_VERIFY_HEADERS: dict[str, str] = {
@@ -178,6 +184,8 @@ class _CookieRecord(_Base):
     account_hash  SHA-256 del email normalizado (no se guarda el email en claro).
     region        'os' (HoYoLab global) o 'cn' (Miyoushe).
     cookies_json  JSON del dict de cookies.
+    device_id     UUID del dispositivo usado en el login. Se reutiliza en
+                  requests posteriores para simular un dispositivo real.
     updated_at    Última actualización (UTC).
     """
     __tablename__ = "hoyo_cookies"
@@ -186,6 +194,7 @@ class _CookieRecord(_Base):
     account_hash = Column(String(64), nullable=False, unique=True, index=True)
     region       = Column(String(8),  nullable=False)
     cookies_json = Column(Text,       nullable=False)
+    device_id    = Column(String(36), nullable=False, default="")
     updated_at   = Column(DateTime(timezone=True), nullable=False)
 
 
@@ -218,15 +227,26 @@ class HoyoSession:
     Atributos:
         cookies     dict de cookies activas de la sesión.
         region      'os' (HoYoLab global) o 'cn' (Miyoushe).
+        device_id   UUID del dispositivo generado durante el login.
+                    Se reutiliza en todos los requests posteriores para
+                    mantener consistencia y evitar señales de automatización.
 
     Uso:
         session = await AuthManager().login("email", "pass")
         accounts = await session.get_game_accounts()
     """
 
-    def __init__(self, cookies: dict[str, str], region: str) -> None:
+    def __init__(
+        self,
+        cookies: dict[str, str],
+        region: str,
+        device_id: typing.Optional[str] = None,
+    ) -> None:
         self.cookies = cookies
         self.region = region
+        # Si no se proporciona device_id (e.g. sesión restaurada de DB sin él),
+        # se genera uno nuevo. Un mismo dispositivo debe usar siempre el mismo ID.
+        self.device_id: str = device_id or str(uuid.uuid4())
 
     @property
     def account_id(self) -> typing.Optional[int]:
@@ -245,8 +265,7 @@ class HoyoSession:
         url: str,
         *,
         params: typing.Optional[dict] = None,
-        # FIX Bug 2: renombrado de 'json' a 'body' para no shadowear
-        # el módulo json importado a nivel de módulo.
+        # Renombrado de 'json' a 'body' para no shadowear el módulo json.
         body: typing.Optional[dict] = None,
         headers: typing.Optional[dict] = None,
     ) -> typing.Any:
@@ -267,8 +286,6 @@ class HoyoSession:
         if headers:
             merged_headers.update(headers)
 
-        # FIX Bug 1: _make_session() eliminada, la sesión se crea
-        # directamente aquí con DummyCookieJar para control total de cookies.
         async with aiohttp.ClientSession(
             cookie_jar=aiohttp.DummyCookieJar()
         ) as http_session:
@@ -276,7 +293,7 @@ class HoyoSession:
                 method,
                 url,
                 params=params,
-                json=body,          # aiohttp espera 'json', no 'body'
+                json=body,           # aiohttp espera 'json', no 'body'
                 headers=merged_headers,
                 cookies=self.cookies,
             ) as resp:
@@ -317,6 +334,7 @@ class HoyoSession:
         return (
             f"<HoyoSession region={self.region!r} "
             f"account_id={self.account_id} "
+            f"device_id={self.device_id!r} "
             f"cookies={list(self.cookies.keys())}>"
         )
 
@@ -374,7 +392,7 @@ class AuthManager:
           3. Si HoYoverse activa un captcha Geetest, abre el navegador.
           4. Si HoYoverse pide verificación por email, solicita el código por consola.
           5. Guarda las cookies nuevas en la DB para futuros usos.
-          6. Devuelve HoyoSession.
+          6. Devuelve HoyoSession con el device_id del login persistido.
 
         Parámetros:
             email       Email o nombre de usuario de HoYoLab / Miyoushe.
@@ -388,18 +406,18 @@ class AuthManager:
         """
         # 1. Intentar cookies guardadas
         if region:
-            cached = self._load_cookies(email, region)
-            if cached:
-                session = HoyoSession(cached, region)
+            cached_cookies, cached_device_id = self._load_cookies(email, region)
+            if cached_cookies:
+                session = HoyoSession(cached_cookies, region, cached_device_id)
                 if await self._validate_session(session):
                     logger.info("Sesión restaurada desde DB para %s (%s)", email, region)
                     return session
                 logger.info("Cookies caducadas para %s, haciendo login de nuevo.", email)
         else:
             for r in ("os", "cn"):
-                cached = self._load_cookies(email, r)  # type: ignore[arg-type]
-                if cached:
-                    session = HoyoSession(cached, r)
+                cached_cookies, cached_device_id = self._load_cookies(email, r)  # type: ignore[arg-type]
+                if cached_cookies:
+                    session = HoyoSession(cached_cookies, r, cached_device_id)
                     if await self._validate_session(session):
                         logger.info("Sesión restaurada desde DB para %s (%s)", email, r)
                         return session
@@ -407,21 +425,21 @@ class AuthManager:
         # 2. Login con la API
         detected_region: typing.Literal["os", "cn"] = region or "os"
         try:
-            cookies = await self._do_login(email, password, region=detected_region)
+            cookies, device_id = await self._do_login(email, password, region=detected_region)
             final_region = detected_region
         except LoginError:
             if region is None and detected_region == "os":
                 logger.info("Login OS fallido para %s, intentando CN...", email)
-                cookies = await self._do_login(email, password, region="cn")
+                cookies, device_id = await self._do_login(email, password, region="cn")
                 final_region = "cn"
             else:
                 raise
 
-        # 3. Persistir cookies
-        self._save_cookies(email, final_region, cookies)
+        # 3. Persistir cookies y device_id
+        self._save_cookies(email, final_region, cookies, device_id)
         logger.info("Login exitoso para %s (%s)", email, final_region)
 
-        return HoyoSession(cookies, final_region)
+        return HoyoSession(cookies, final_region, device_id)
 
     async def logout(self, email: str) -> None:
         """Elimina las cookies guardadas de un usuario de la DB."""
@@ -446,14 +464,20 @@ class AuthManager:
         email: str,
         password: str,
         region: typing.Literal["os", "cn"],
-    ) -> dict[str, str]:
-        """Despacha al flujo de login correcto según la región."""
+    ) -> tuple[dict[str, str], str]:
+        """
+        Despacha al flujo de login correcto según la región.
+
+        Devuelve tupla (cookies, device_id).
+        """
         if region == "os":
             return await self._os_login_flow(email, password)
         else:
             return await self._cn_login_flow(email, password)
 
-    async def _os_login_flow(self, email: str, password: str) -> dict[str, str]:
+    async def _os_login_flow(
+        self, email: str, password: str
+    ) -> tuple[dict[str, str], str]:
         """
         Login vía HoYoLab web endpoint (región global).
 
@@ -461,7 +485,7 @@ class AuthManager:
           - Captcha Geetest (-3101): abre el navegador para resolverlo.
           - Verificación de email (-3239): solicita el código por consola.
 
-        Devuelve dict de cookies si tiene éxito.
+        Devuelve tupla (cookies, device_id).
         """
         device_id = str(uuid.uuid4())
         headers = {
@@ -469,8 +493,8 @@ class AuthManager:
             "x-rpc-device_id": device_id,
         }
         payload = {
-            "account": _encrypt_credentials(email, 1),
-            "password": _encrypt_credentials(password, 1),
+            "account":    _encrypt_credentials(email, 1),
+            "password":   _encrypt_credentials(password, 1),
             "token_type": 6,
         }
 
@@ -479,11 +503,9 @@ class AuthManager:
         # --- Captcha activado ---
         if resp["retcode"] == -3101:
             logger.info("Captcha activado en login OS. Abriendo navegador...")
-            # El header x-rpc-aigis contiene los datos del captcha como JSON
             aigis_raw = resp["headers"].get("x-rpc-aigis", "{}")
             aigis = json.loads(aigis_raw)
 
-            # El campo 'data' puede venir como string JSON anidado
             if isinstance(aigis.get("data"), str):
                 aigis["data"] = json.loads(aigis["data"])
 
@@ -503,37 +525,32 @@ class AuthManager:
             headers["x-rpc-aigis"] = _build_aigis_header(mmt_result)
             resp = await self._raw_post(_WEB_LOGIN_URL, payload, headers)
 
-        # FIX Bug 3: verificación de email requerida (-3239)
+        # --- Verificación de email requerida (-3239) ---
         if resp["retcode"] == -3239:
-            logger.info("Verificación de email requerida para %s.", email)
+            logger.info("Verificación de email requerida.")
             action_ticket_raw = resp["headers"].get("x-rpc-verify", "{}")
             action_ticket = json.loads(action_ticket_raw)
 
-            # Parsear verify_str si viene como string
             if isinstance(action_ticket.get("verify_str"), str):
                 action_ticket["verify_str"] = json.loads(action_ticket["verify_str"])
 
             ticket_str = action_ticket["verify_str"]["ticket"]
 
-            # Enviar el código de verificación al email del usuario
             await self._send_verification_email(ticket_str, headers=headers)
 
-            # Solicitar el código al usuario por consola
             code = await enter_code(
                 "Introduce el código de verificación enviado a tu email: "
             )
 
-            # Verificar el código
             await self._verify_email_code(
                 code=code,
                 action_ticket=action_ticket["risk_ticket"],
                 verify_ticket=ticket_str,
             )
 
-            # Reintentar el login con el ticket verificado
             headers["x-rpc-verify"] = json.dumps({
-                "risk_ticket": action_ticket["risk_ticket"],
-                "verify_str": json.dumps(action_ticket["verify_str"]),
+                "risk_ticket":  action_ticket["risk_ticket"],
+                "verify_str":   json.dumps(action_ticket["verify_str"]),
             })
             resp = await self._raw_post(_WEB_LOGIN_URL, payload, headers)
 
@@ -541,7 +558,6 @@ class AuthManager:
             _raise_login_error(resp["retcode"], resp.get("message", ""))
 
         cookies = resp["cookies"]
-        # Algunos flujos devuelven stoken en el body de datos
         if resp["data"] and resp["data"].get("stoken"):
             cookies["stoken"] = resp["data"]["stoken"]
 
@@ -551,18 +567,24 @@ class AuthManager:
                 "Puede que la cuenta requiera pasos adicionales."
             )
 
-        return cookies
+        return cookies, device_id
 
-    async def _cn_login_flow(self, email: str, password: str) -> dict[str, str]:
+    async def _cn_login_flow(
+        self, email: str, password: str
+    ) -> tuple[dict[str, str], str]:
         """
         Login vía Miyoushe web endpoint (región CN).
 
         Maneja captcha Geetest (-3102).
-        Devuelve dict de cookies si tiene éxito.
+        Devuelve tupla (cookies, device_id).
         """
-        headers = {**_CN_LOGIN_HEADERS}
+        device_id = str(uuid.uuid4())
+        headers = {
+            **_CN_LOGIN_HEADERS,
+            "x-rpc-device_id": device_id,
+        }
         payload = {
-            "account": _encrypt_credentials(email, 2),
+            "account":  _encrypt_credentials(email, 2),
             "password": _encrypt_credentials(password, 2),
         }
 
@@ -603,7 +625,7 @@ class AuthManager:
                 "Puede que la cuenta requiera pasos adicionales."
             )
 
-        return cookies
+        return cookies, device_id
 
     # ------------------------------------------------------------------
     # Verificación de email
@@ -621,7 +643,6 @@ class AuthManager:
         """
         send_headers = {**_EMAIL_SEND_HEADERS}
         if headers:
-            # Propagar headers relevantes como x-rpc-aigis si los hay
             for key in ("x-rpc-aigis", "x-rpc-device_id"):
                 if key in headers:
                     send_headers[key] = headers[key]
@@ -629,7 +650,7 @@ class AuthManager:
         resp = await self._raw_post(
             _SEND_VERIFICATION_URL,
             {
-                "action_type": "verify_for_component",
+                "action_type":   "verify_for_component",
                 "action_ticket": ticket,
             },
             send_headers,
@@ -654,10 +675,10 @@ class AuthManager:
         resp = await self._raw_post(
             _VERIFY_EMAIL_URL,
             {
-                "action_type": "verify_for_component",
-                "action_ticket": verify_ticket,
-                "email_captcha": code,
-                "verify_method": 2,
+                "action_type":    "verify_for_component",
+                "action_ticket":  verify_ticket,
+                "email_captcha":  code,
+                "verify_method":  2,
             },
             _EMAIL_VERIFY_HEADERS,
         )
@@ -709,7 +730,7 @@ class AuthManager:
         return {
             "retcode": body.get("retcode", 0),
             "message": body.get("message", ""),
-            "data": body.get("data"),
+            "data":    body.get("data"),
             "headers": resp_headers,
             "cookies": resp_cookies,
         }
@@ -740,8 +761,9 @@ class AuthManager:
         email: str,
         region: str,
         cookies: dict[str, str],
+        device_id: str,
     ) -> None:
-        """Guarda o actualiza las cookies de un usuario en la DB (upsert)."""
+        """Guarda o actualiza cookies y device_id de un usuario en la DB (upsert)."""
         account_hash = _hash_email(email)
         now = datetime.now(timezone.utc)
 
@@ -754,13 +776,15 @@ class AuthManager:
 
             if record:
                 record.cookies_json = json.dumps(cookies)
-                record.region = region
-                record.updated_at = now
+                record.region       = region
+                record.device_id    = device_id
+                record.updated_at   = now
             else:
                 record = _CookieRecord(
                     account_hash=account_hash,
                     region=region,
                     cookies_json=json.dumps(cookies),
+                    device_id=device_id,
                     updated_at=now,
                 )
                 db.add(record)
@@ -771,10 +795,10 @@ class AuthManager:
         self,
         email: str,
         region: str,
-    ) -> typing.Optional[dict[str, str]]:
+    ) -> tuple[typing.Optional[dict[str, str]], typing.Optional[str]]:
         """
-        Carga cookies guardadas para un usuario y región.
-        Devuelve None si no existen registros.
+        Carga cookies y device_id guardados para un usuario y región.
+        Devuelve (None, None) si no existen registros.
         """
         account_hash = _hash_email(email)
 
@@ -787,9 +811,9 @@ class AuthManager:
             ).scalar_one_or_none()
 
         if record is None:
-            return None
+            return None, None
 
-        return json.loads(record.cookies_json)
+        return json.loads(record.cookies_json), record.device_id or None
 
 
 # ---------------------------------------------------------------------------
