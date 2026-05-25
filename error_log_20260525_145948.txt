@@ -1,0 +1,155 @@
+2026-05-25 15:00:23 | INFO     | __main__:148 | Iniciando login para 'test2'...
+2026-05-25 15:00:23 | ERROR    | app:145 | Error inesperado al registrar cuenta 'test2'.
+Traceback (most recent call last):
+
+  File "D:\Projects\hoyo_buddy_local\main.py", line 359, in <module>
+    main()
+    └ <function main at 0x0000026F9D0BE8D0>
+
+  File "D:\Projects\hoyo_buddy_local\main.py", line 347, in main
+    asyncio.run(run())
+    │       │   └ <function run at 0x0000026F9D0BE770>
+    │       └ <function run at 0x0000026F99A0C930>
+    └ <module 'asyncio' from 'C:\\Program Files\\Python314\\Lib\\asyncio\\__init__.py'>
+
+  File "C:\Program Files\Python314\Lib\asyncio\runners.py", line 204, in run
+    return runner.run(main)
+           │      │   └ <coroutine object run at 0x0000026F9CE3DB40>
+           │      └ <function Runner.run at 0x0000026F99A0CD50>
+           └ <asyncio.runners.Runner object at 0x0000026F99C49160>
+  File "C:\Program Files\Python314\Lib\asyncio\runners.py", line 127, in run
+    return self._loop.run_until_complete(task)
+           │    │     │                  └ <Task pending name='Task-1' coro=<run() running at D:\Projects\hoyo_buddy_local\main.py:326> cb=[_run_until_complete_cb() at ...
+           │    │     └ <function BaseEventLoop.run_until_complete at 0x0000026F999ED170>
+           │    └ <ProactorEventLoop running=True closed=False debug=False>
+           └ <asyncio.runners.Runner object at 0x0000026F99C49160>
+  File "C:\Program Files\Python314\Lib\asyncio\base_events.py", line 706, in run_until_complete
+    self.run_forever()
+    │    └ <function BaseEventLoop.run_forever at 0x0000026F999ED0C0>
+    └ <ProactorEventLoop running=True closed=False debug=False>
+  File "C:\Program Files\Python314\Lib\asyncio\base_events.py", line 677, in run_forever
+    self._run_once()
+    │    └ <function BaseEventLoop._run_once at 0x0000026F999EF1C0>
+    └ <ProactorEventLoop running=True closed=False debug=False>
+  File "C:\Program Files\Python314\Lib\asyncio\base_events.py", line 2057, in _run_once
+    handle._run()
+    │      └ <function Handle._run at 0x0000026F9995F740>
+    └ <Handle <_asyncio.TaskStepMethWrapper object at 0x0000026F9CF9FE80>()>
+  File "C:\Program Files\Python314\Lib\asyncio\events.py", line 94, in _run
+    self._context.run(self._callback, *self._args)
+    │    │            │    │           │    └ <member '_args' of 'Handle' objects>
+    │    │            │    │           └ <Handle <_asyncio.TaskStepMethWrapper object at 0x0000026F9CF9FE80>()>
+    │    │            │    └ <member '_callback' of 'Handle' objects>
+    │    │            └ <Handle <_asyncio.TaskStepMethWrapper object at 0x0000026F9CF9FE80>()>
+    │    └ <member '_context' of 'Handle' objects>
+    └ <Handle <_asyncio.TaskStepMethWrapper object at 0x0000026F9CF9FE80>()>
+
+  File "D:\Projects\hoyo_buddy_local\main.py", line 326, in run
+    await _action_add_account(ctx)
+          │                   └ AppContext(cookie_store=<db.cookie_store.CookieStore object at 0x0000026F99C48440>, account_store=<db.account_store.AccountSt...
+          └ <function _action_add_account at 0x0000026F9D0BE090>
+
+  File "D:\Projects\hoyo_buddy_local\main.py", line 150, in _action_add_account
+    result = await add_account(ctx, alias, email, password, region=region)
+                   │           │    │      │      │                └ None
+                   │           │    │      │      └ 'Sandro2004'
+                   │           │    │      └ 'meidowow@gmail.com'
+                   │           │    └ 'test2'
+                   │           └ AppContext(cookie_store=<db.cookie_store.CookieStore object at 0x0000026F99C48440>, account_store=<db.account_store.AccountSt...
+                   └ <function add_account at 0x0000026F9D0BCF60>
+
+> File "D:\Projects\hoyo_buddy_local\app.py", line 133, in add_account
+    session = await ctx.manager.login(email, password, region=region)
+                    │   │             │      │                └ None
+                    │   │             │      └ 'Sandro2004'
+                    │   │             └ 'meidowow@gmail.com'
+                    │   └ _tuplegetter(2, 'Alias for field number 2')
+                    └ AppContext(cookie_store=<db.cookie_store.CookieStore object at 0x0000026F99C48440>, account_store=<db.account_store.AccountSt...
+
+  File "D:\Projects\hoyo_buddy_local\HoyoWrapper\session_manager.py", line 164, in login
+    hoyo_session = await self._auth.login(email, password, region=region)
+                         │    │     │     │      │                └ None
+                         │    │     │     │      └ 'Sandro2004'
+                         │    │     │     └ 'meidowow@gmail.com'
+                         │    │     └ <function AuthManager.login at 0x0000026F9D04A770>
+                         │    └ <HoyoWrapper.auth_manager.AuthManager object at 0x0000026F9D087380>
+                         └ <HoyoWrapper.session_manager.HoyoManager object at 0x0000026F9D087230>
+
+  File "D:\Projects\hoyo_buddy_local\HoyoWrapper\auth_manager.py", line 223, in login
+    cookies, device_id = await self._do_login(email, password, region=detected)
+    │                          │    │         │      │                └ 'os'
+    │                          │    │         │      └ 'Sandro2004'
+    │                          │    │         └ 'meidowow@gmail.com'
+    │                          │    └ <function AuthManager._do_login at 0x0000026F9D04AA30>
+    │                          └ <HoyoWrapper.auth_manager.AuthManager object at 0x0000026F9D087380>
+    └ None
+
+  File "D:\Projects\hoyo_buddy_local\HoyoWrapper\auth_manager.py", line 256, in _do_login
+    return await self._os_login_flow(email, password)
+                 │    │              │      └ 'Sandro2004'
+                 │    │              └ 'meidowow@gmail.com'
+                 │    └ <function AuthManager._os_login_flow at 0x0000026F9D04AB90>
+                 └ <HoyoWrapper.auth_manager.AuthManager object at 0x0000026F9D087380>
+
+  File "D:\Projects\hoyo_buddy_local\HoyoWrapper\auth_manager.py", line 269, in _os_login_flow
+    "account":    _encrypt_credentials(email, 1),
+                  │                    └ 'meidowow@gmail.com'
+                  └ <function _encrypt_credentials at 0x0000026F9CE694E0>
+
+  File "D:\Projects\hoyo_buddy_local\HoyoWrapper\auth_manager.py", line 135, in _encrypt_credentials
+    key = RSA.import_key(key_pem)
+          │   │          └ '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4PMS2JVMwBsOIrYWRluY\nwEiFZL7ApCOqlnMlsn4ufLSFG4b/2T...
+          │   └ <function import_key at 0x0000026F9D41C930>
+          └ <module 'Crypto.PublicKey.RSA' from 'D:\\Projects\\hoyo_buddy_local\\.venv\\Lib\\site-packages\\Crypto\\PublicKey\\RSA.py'>
+
+  File "D:\Projects\hoyo_buddy_local\.venv\Lib\site-packages\Crypto\PublicKey\RSA.py", line 836, in import_key
+    (der, marker, enc_flag) = PEM.decode(tostr(extern_key), passphrase)
+                              │   │      │     │            └ None
+                              │   │      │     └ b'-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4PMS2JVMwBsOIrYWRluY\nwEiFZL7ApCOqlnMlsn4ufLSFG4b/2...
+                              │   │      └ <function tostr at 0x0000026F9D37C7D0>
+                              │   └ <function decode at 0x0000026F9D43D170>
+                              └ <module 'Crypto.IO.PEM' from 'D:\\Projects\\hoyo_buddy_local\\.venv\\Lib\\site-packages\\Crypto\\IO\\PEM.py'>
+  File "D:\Projects\hoyo_buddy_local\.venv\Lib\site-packages\Crypto\IO\PEM.py", line 181, in decode
+    data = a2b_base64(''.join(lines[1:-1]))
+           │                  └ ['-----BEGINPUBLICKEY-----', 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4PMS2JVMwBsOIrYWRluY', 'wEiFZL7ApCOqlnMlsn4ufLSFG4b...
+           └ <built-in function a2b_base64>
+
+binascii.Error: Incorrect padding
+2026-05-25 15:00:23 | ERROR    | __main__:162 | Error al registrar cuenta: Error inesperado: Incorrect padding
+2026-05-25 15:01:07 | ERROR    | __main__:352 | Error no capturado. Consulta hoyo_wrapper.log para el traceback completo.
+Traceback (most recent call last):
+
+  File "D:\Projects\hoyo_buddy_local\main.py", line 359, in <module>
+    main()
+    └ <function main at 0x0000026F9D0BE8D0>
+
+> File "D:\Projects\hoyo_buddy_local\main.py", line 347, in main
+    asyncio.run(run())
+    │       │   └ <function run at 0x0000026F9D0BE770>
+    │       └ <function run at 0x0000026F99A0C930>
+    └ <module 'asyncio' from 'C:\\Program Files\\Python314\\Lib\\asyncio\\__init__.py'>
+
+  File "C:\Program Files\Python314\Lib\asyncio\runners.py", line 204, in run
+    return runner.run(main)
+           │      │   └ <coroutine object run at 0x0000026F9CE3DB40>
+           │      └ <function Runner.run at 0x0000026F99A0CD50>
+           └ <asyncio.runners.Runner object at 0x0000026F99C49160>
+  File "C:\Program Files\Python314\Lib\asyncio\runners.py", line 127, in run
+    return self._loop.run_until_complete(task)
+           │    │                        └ <Task finished name='Task-1' coro=<run() done, defined at D:\Projects\hoyo_buddy_local\main.py:311> exception=EOFError()>
+           │    └ None
+           └ <asyncio.runners.Runner object at 0x0000026F99C49160>
+  File "C:\Program Files\Python314\Lib\asyncio\base_events.py", line 719, in run_until_complete
+    return future.result()
+           │      └ <method 'result' of '_asyncio.Task' objects>
+           └ <Task finished name='Task-1' coro=<run() done, defined at D:\Projects\hoyo_buddy_local\main.py:311> exception=EOFError()>
+
+  File "D:\Projects\hoyo_buddy_local\main.py", line 323, in run
+    choice = _ask("Opcion: ")
+             └ <function _ask at 0x0000026F9D0BDC70>
+
+  File "D:\Projects\hoyo_buddy_local\main.py", line 94, in _ask
+    return input(f"  {prompt}").strip()
+                      └ 'Opcion: '
+
+EOFError

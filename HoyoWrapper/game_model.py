@@ -254,11 +254,17 @@ class BaseGame:
         params: typing.Optional[dict] = None,
         headers: typing.Optional[dict] = None,
     ) -> typing.Any:
-        """GET autenticado con retry ante rate limits."""
-        @tenacity.retry(**_RETRY_KWARGS)
-        async def _inner() -> typing.Any:
-            return await self.session.request("GET", url, params=params, headers=headers)
-        return await _inner()
+        """
+        GET autenticado con retry ante rate limits.
+
+        Usa tenacity.AsyncRetrying directamente (sin funciones anidadas)
+        para que aioresponses pueda interceptar requests en tests.
+        """
+        async for attempt in tenacity.AsyncRetrying(**_RETRY_KWARGS):
+            with attempt:
+                return await self.session.request(
+                    "GET", url, params=params, headers=headers
+                )
 
     async def _post(
         self,
@@ -267,15 +273,18 @@ class BaseGame:
         params: typing.Optional[dict] = None,
         headers: typing.Optional[dict] = None,
     ) -> typing.Any:
-        """POST autenticado con retry ante rate limits.
-        Usa 'body' porque HoyoSession.request() así lo requiere.
         """
-        @tenacity.retry(**_RETRY_KWARGS)
-        async def _inner() -> typing.Any:
-            return await self.session.request(
-                "POST", url, params=params, body=data, headers=headers
-            )
-        return await _inner()
+        POST autenticado con retry ante rate limits.
+        Usa 'body' porque HoyoSession.request() asi lo requiere.
+
+        Usa tenacity.AsyncRetrying directamente (sin funciones anidadas)
+        para que aioresponses pueda interceptar requests en tests.
+        """
+        async for attempt in tenacity.AsyncRetrying(**_RETRY_KWARGS):
+            with attempt:
+                return await self.session.request(
+                    "POST", url, params=params, body=data, headers=headers
+                )
 
     # ------------------------------------------------------------------
     # Check-in diario

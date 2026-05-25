@@ -3,14 +3,18 @@ db/
 ---
 Paquete de persistencia local.
 
-Exporta únicamente CookieStore: la interfaz para guardar y recuperar
-cookies de sesión. No conoce nada de HoYoverse.
+Exporta:
+  CookieStore    Almacen de cookies de sesion por usuario y region.
+  AccountStore   Almacen de cuentas registradas con alias legible.
 
-Uso desde main.py o desde cualquier capa superior:
-    from db import CookieStore
-    store = CookieStore("./hoyo_auth.db")
+Uso:
+    from db import CookieStore, AccountStore
+
+    cookie_store  = CookieStore("./hoyo_auth.db")
+    account_store = AccountStore("./hoyo_auth.db")
 """
 
 from db.cookie_store import CookieStore
+from db.account_store import AccountStore
 
-__all__ = ["CookieStore"]
+__all__ = ["CookieStore", "AccountStore"]

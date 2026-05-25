@@ -1,0 +1,154 @@
+[REPORT_START]
+timestamp:      2026-05-25T14:52:18.298468
+project:        HoYoWrapper
+modules_run:    cookie, account, session, game, auth, manager, app
+filter:         none
+total_tests:    125
+total_passed:   125
+total_failed:   0
+global_status:  PASS
+
+[MODULE_START]
+label:    db.CookieStore - Persistencia y seguridad
+path:     tests/test_cookie_store.py
+status:   PASS
+passed:   13
+failed:   0
+errors:   0
+warnings: 0
+
+[PYTEST_OUTPUT]
+============================= test session starts =============================
+collected 13 items
+
+tests\test_cookie_store.py .............                                 [100%]
+
+============================= 13 passed in 0.20s ==============================
+[PYTEST_OUTPUT_END]
+[MODULE_END]
+
+[MODULE_START]
+label:    db.AccountStore - Cuentas con alias
+path:     tests/test_account_store.py
+status:   PASS
+passed:   18
+failed:   0
+errors:   0
+warnings: 0
+
+[PYTEST_OUTPUT]
+============================= test session starts =============================
+collected 18 items
+
+tests\test_account_store.py ..................                           [100%]
+
+============================= 18 passed in 0.14s ==============================
+[PYTEST_OUTPUT_END]
+[MODULE_END]
+
+[MODULE_START]
+label:    HoyoSession - Sesion autenticada
+path:     tests/test_session.py
+status:   PASS
+passed:   14
+failed:   0
+errors:   0
+warnings: 0
+
+[PYTEST_OUTPUT]
+============================= test session starts =============================
+collected 14 items
+
+tests\test_session.py ..............                                     [100%]
+
+============================= 14 passed in 0.29s ==============================
+[PYTEST_OUTPUT_END]
+[MODULE_END]
+
+[MODULE_START]
+label:    BaseGame / Juegos - Check-in, Mimo, Anti-deteccion
+path:     tests/test_game_model.py
+status:   PASS
+passed:   34
+failed:   0
+errors:   0
+warnings: 0
+
+[PYTEST_OUTPUT]
+============================= test session starts =============================
+collected 34 items
+
+tests\test_game_model.py ..................................              [100%]
+
+============================= 34 passed in 0.30s ==============================
+[PYTEST_OUTPUT_END]
+[MODULE_END]
+
+[MODULE_START]
+label:    AuthManager - Login y flujos de autenticacion
+path:     tests/test_auth_manager.py
+status:   PASS
+passed:   10
+failed:   0
+errors:   0
+warnings: 0
+
+[PYTEST_OUTPUT]
+============================= test session starts =============================
+collected 10 items
+
+tests\test_auth_manager.py ..........                                    [100%]
+
+============================= 10 passed in 0.10s ==============================
+[PYTEST_OUTPUT_END]
+[MODULE_END]
+
+[MODULE_START]
+label:    HoyoManager / ActiveSession - Orquestacion
+path:     tests/test_session_manager.py
+status:   PASS
+passed:   15
+failed:   0
+errors:   0
+warnings: 0
+
+[PYTEST_OUTPUT]
+============================= test session starts =============================
+collected 15 items
+
+tests\test_session_manager.py ...............                            [100%]
+
+============================= 15 passed in 0.09s ==============================
+[PYTEST_OUTPUT_END]
+[MODULE_END]
+
+[MODULE_START]
+label:    App - Logica de negocio del main
+path:     tests/test_app.py
+status:   PASS
+passed:   21
+failed:   0
+errors:   0
+warnings: 0
+
+[PYTEST_OUTPUT]
+============================= test session starts =============================
+collected 21 items
+
+tests\test_app.py .....................                                  [100%]
+
+============================= 21 passed in 1.28s ==============================
+[PYTEST_OUTPUT_END]
+[MODULE_END]
+
+[SUMMARY]
+  PASS  db.CookieStore - Persistencia y seguridad                     passed=13  failed=0
+  PASS  db.AccountStore - Cuentas con alias                           passed=18  failed=0
+  PASS  HoyoSession - Sesion autenticada                              passed=14  failed=0
+  PASS  BaseGame / Juegos - Check-in, Mimo, Anti-deteccion            passed=34  failed=0
+  PASS  AuthManager - Login y flujos de autenticacion                 passed=10  failed=0
+  PASS  HoyoManager / ActiveSession - Orquestacion                    passed=15  failed=0
+  PASS  App - Logica de negocio del main                              passed=21  failed=0
+
+global_status: PASS - all tests passed
+[REPORT_END]

@@ -27,7 +27,7 @@ import logging
 import typing
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, select
+from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 __all__ = ["CookieStore"]
@@ -58,8 +58,13 @@ class _CookieRecord(_Base):
     """
     __tablename__ = "hoyo_cookies"
 
+    __table_args__ = (
+        # Unicidad compuesta: mismo usuario puede tener OS y CN independientes
+        UniqueConstraint("account_hash", "region", name="uq_account_region"),
+    )
+
     id           = Column(Integer,  primary_key=True, autoincrement=True)
-    account_hash = Column(String(64), nullable=False, unique=True, index=True)
+    account_hash = Column(String(64), nullable=False, index=True)
     region       = Column(String(8),  nullable=False)
     cookies_json = Column(Text,       nullable=False)
     device_id    = Column(String(36), nullable=False, default="")
@@ -141,12 +146,12 @@ class CookieStore:
             record = db.execute(
                 select(_CookieRecord).where(
                     _CookieRecord.account_hash == account_hash,
+                    _CookieRecord.region == region,
                 )
             ).scalar_one_or_none()
 
             if record:
                 record.cookies_json = json.dumps(cookies)
-                record.region       = region
                 record.device_id    = device_id
                 record.updated_at   = now
             else:
@@ -161,6 +166,29 @@ class CookieStore:
 
             db.commit()
             logger.debug("CookieStore: cookies guardadas para hash=%s (%s).", account_hash[:8], region)
+
+    def get_by_hash(
+        self,
+        account_hash: str,
+        region: str,
+    ) -> tuple[typing.Optional[dict[str, str]], typing.Optional[str]]:
+        """
+        Recupera cookies y device_id directamente por account_hash y region.
+
+        Usado por la app para restaurar sesiones sin necesitar el email.
+        Devuelve (cookies_dict, device_id) si existen, (None, None) si no.
+        """
+        with self._factory() as db:
+            record = db.execute(
+                select(_CookieRecord).where(
+                    _CookieRecord.account_hash == account_hash,
+                    _CookieRecord.region == region,
+                )
+            ).scalar_one_or_none()
+
+        if record is None:
+            return None, None
+        return json.loads(record.cookies_json), record.device_id or None
 
     def delete(self, email: str) -> None:
         """
