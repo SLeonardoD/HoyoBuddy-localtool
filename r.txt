@@ -2,6 +2,7 @@ sqlalchemy
 loguru
 aiohttp
 pycryptodome
+cryptography
 
 #testing
 pytest>=8.0

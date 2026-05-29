@@ -218,3 +218,5 @@ __marimo__/
 # Personal
 .doc/
 .vscode/
+test_output.txt
+error_log*.txt

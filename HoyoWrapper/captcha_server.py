@@ -60,6 +60,7 @@ class SessionMMTResult(typing.TypedDict):
 
 _CAPTCHA_PAGE = """<!DOCTYPE html>
 <head>
+  <meta charset="utf-8"/>
   <meta name="referrer" content="no-referrer"/>
   <style>
     body {{
