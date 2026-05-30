@@ -1,24 +1,20 @@
 """
-captcha_server.py
------------------
+HoyoWrapper/captcha_server.py
+------------------------------
 Servidor web local temporal para resolver captchas Geetest de HoYoverse.
 
-Cuando el login con email+contraseña activa un captcha, este módulo:
-1. Levanta un servidor HTTP en localhost (por defecto puerto 5000)
-2. Abre el navegador del usuario automáticamente
-3. Sirve la página con el widget Geetest
-4. Espera a que el usuario lo resuelva
-5. Recibe el resultado y apaga el servidor
-6. Devuelve los datos del captcha resuelto al flujo de auth
+Flujo:
+  1. Levanta un servidor HTTP en localhost (por defecto puerto 5000).
+  2. Abre el navegador del usuario automaticamente.
+  3. Sirve la pagina con el widget Geetest v3.
+  4. Espera a que el usuario (o el widget en modo silencioso) lo resuelva.
+  5. Recibe el resultado via POST /send-data.
+  6. Apaga el servidor y devuelve el resultado al flujo de auth.
 
-Copiado y simplificado de genshin.py/genshin/client/components/auth/server.py
-Solo se mantiene el flujo relevante para login web (SessionMMT / SessionMMTResult).
-
-Correcciones respecto a la versión anterior:
-  - Bug 4: asyncio.get_event_loop() reemplazado por asyncio.get_running_loop()
-            compatible con Python 3.10+ y 3.12+.
-  - solve_geetest() ahora es async (era sync devolviendo una coroutine,
-    lo que causaría warnings en algunas versiones de Python).
+Logging exhaustivo via loguru:
+  - Cada evento del ciclo de vida del servidor queda registrado.
+  - El resultado completo del captcha (challenge, validate, seccode)
+    se loguea en DEBUG para diagnosticar rechazos del servidor de HoYoverse.
 """
 
 from __future__ import annotations
@@ -29,6 +25,7 @@ import webbrowser
 
 import aiohttp
 from aiohttp import web
+from loguru import logger
 
 __all__ = ["SessionMMT", "SessionMMTResult", "solve_geetest", "enter_code"]
 
@@ -55,7 +52,7 @@ class SessionMMTResult(typing.TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Página HTML con el widget Geetest
+# Pagina HTML con el widget Geetest
 # ---------------------------------------------------------------------------
 
 _CAPTCHA_PAGE = """<!DOCTYPE html>
@@ -80,7 +77,7 @@ _CAPTCHA_PAGE = """<!DOCTYPE html>
 </head>
 <html>
   <body>
-    <h2>HoYoverse — verificación de seguridad</h2>
+    <h2>HoYoverse &mdash; verificacion de seguridad</h2>
     <div id="captcha-container"></div>
     <p id="status">Cargando captcha...</p>
   </body>
@@ -99,21 +96,36 @@ _CAPTCHA_PAGE = """<!DOCTYPE html>
           product: "bind",
           lang: "{lang}",
         }}, captcha => {{
-          captcha.onReady(() => captcha.verify());
+          captcha.onReady(() => {{
+            console.log("[Captcha] Widget listo. Iniciando verificacion...");
+            captcha.verify();
+          }});
           captcha.onSuccess(() => {{
             const result = {{
               session_id: mmt.session_id,
               ...captcha.getValidate()
             }};
+            console.log("[Captcha] Resuelto:", JSON.stringify(result));
             fetch("/send-data", {{
               method: "POST",
               headers: {{"Content-Type": "application/json"}},
               body: JSON.stringify(result),
+            }}).then(r => {{
+              console.log("[Captcha] Resultado enviado al servidor. Status:", r.status);
             }});
             document.getElementById("status").textContent =
               "Captcha resuelto. Puedes cerrar esta ventana.";
           }});
+          captcha.onError((err) => {{
+            console.error("[Captcha] Error en el widget:", err);
+            document.getElementById("status").textContent =
+              "Error en el captcha: " + JSON.stringify(err);
+          }});
         }});
+      }})
+      .catch(err => {{
+        console.error("[Captcha] Error cargando MMT:", err);
+        document.getElementById("status").textContent = "Error cargando el captcha.";
       }});
   </script>
 </html>"""
@@ -134,14 +146,20 @@ async def _launch_webapp(
     port: int = 5000,
 ) -> SessionMMTResult:
     """
-    Levanta un servidor HTTP local, abre el browser y espera a que el usuario
-    resuelva el captcha Geetest.
+    Levanta un servidor HTTP local, abre el browser y espera el resultado
+    del captcha Geetest.
 
-    Devuelve SessionMMTResult si el usuario lo resuelve antes de 5 minutos,
-    o lanza RuntimeError si se agota el tiempo.
+    Devuelve SessionMMTResult si se resuelve antes de 5 minutos.
+    Lanza RuntimeError si se agota el tiempo.
     """
-    # FIX Bug 4: get_running_loop() en lugar del deprecado get_event_loop().
-    # Siempre hay un loop activo aquí porque esta función es async.
+    logger.debug(
+        "[CAPTCHA] Iniciando servidor local. "
+        "puerto={} api_server={} lang={} gt={} challenge={}",
+        port, api_server, lang,
+        mmt.get("gt", "?"),
+        mmt.get("challenge", "?"),
+    )
+
     loop = asyncio.get_running_loop()
     future: asyncio.Future[SessionMMTResult] = loop.create_future()
 
@@ -149,29 +167,102 @@ async def _launch_webapp(
 
     @router.get("/")
     async def index(request: web.Request) -> web.Response:
+        logger.debug("[CAPTCHA] GET / — sirviendo pagina HTML del captcha.")
         body = _CAPTCHA_PAGE.format(api_server=api_server, lang=lang)
-        return web.Response(body=body, content_type="text/html")
+        return web.Response(
+            body=body.encode("utf-8"),
+            content_type="text/html",
+            charset="utf-8",
+        )
 
     @router.get("/gt/v3.js")
     async def gt_script(request: web.Request) -> web.Response:
         """Sirve el JS de Geetest desde su CDN para evitar bloqueos CORS."""
-        async with aiohttp.ClientSession() as http_session:
-            async with http_session.get(_GT_V3_URL) as r:
-                content = await r.read()
-        return web.Response(body=content, content_type="text/javascript")
+        logger.debug("[CAPTCHA] GET /gt/v3.js — descargando script de Geetest CDN.")
+        try:
+            async with aiohttp.ClientSession() as http_session:
+                async with http_session.get(_GT_V3_URL) as r:
+                    content = await r.read()
+            logger.debug(
+                "[CAPTCHA] Script Geetest descargado. Tamano={} bytes.", len(content)
+            )
+            return web.Response(body=content, content_type="text/javascript")
+        except Exception as e:
+            logger.error("[CAPTCHA] Error descargando script Geetest: {}", e)
+            return web.Response(status=500, text=f"Error descargando Geetest: {e}")
 
     @router.get("/mmt")
     async def mmt_endpoint(request: web.Request) -> web.Response:
         """Devuelve los datos del captcha al frontend."""
-        return web.json_response(dict(mmt))
+        mmt_data = dict(mmt)
+        logger.debug(
+            "[CAPTCHA] GET /mmt — enviando datos al widget: "
+            "gt={} challenge={} new_captcha={} success={} session_id={}",
+            mmt_data.get("gt"),
+            mmt_data.get("challenge"),
+            mmt_data.get("new_captcha"),
+            mmt_data.get("success"),
+            mmt_data.get("session_id"),
+        )
+        return web.json_response(mmt_data)
 
     @router.post("/send-data")
     async def send_data(request: web.Request) -> web.Response:
-        """Recibe el resultado del captcha resuelto por el usuario."""
-        data = await request.json()
-        if not future.done():
-            future.set_result(SessionMMTResult(**data))
-        return web.Response(status=204)
+        """Recibe el resultado del captcha resuelto."""
+        try:
+            data = await request.json()
+            logger.debug(
+                "[CAPTCHA] POST /send-data recibido: "
+                "session_id={} geetest_challenge={} "
+                "geetest_validate={} geetest_seccode={}",
+                data.get("session_id"),
+                data.get("geetest_challenge"),
+                data.get("geetest_validate"),
+                data.get("geetest_seccode"),
+            )
+
+            # Validar que los campos requeridos esten presentes
+            required = ("geetest_challenge", "geetest_validate",
+                        "geetest_seccode", "session_id")
+            missing = [f for f in required if not data.get(f)]
+            if missing:
+                logger.warning(
+                    "[CAPTCHA] Resultado incompleto. Campos faltantes: {}", missing
+                )
+
+            if not future.done():
+                # Delay con distribucion uniforme entre valores con decimales
+                # para simular tiempo de reaccion humano real (3-5s).
+                # Se usa random.uniform para obtener valores como 3.2s, 4.7s, etc.
+                import random
+                delay = round(random.uniform(3.0, 5.0), 2)
+                logger.debug(
+                    "[CAPTCHA] Aplicando delay humano de {}s antes de resolver...",
+                    delay
+                )
+                await asyncio.sleep(delay)
+
+                result = SessionMMTResult(
+                    geetest_challenge=data.get("geetest_challenge", ""),
+                    geetest_validate=data.get("geetest_validate", ""),
+                    geetest_seccode=data.get("geetest_seccode", ""),
+                    session_id=data.get("session_id", mmt.get("session_id", "")),
+                )
+                logger.info(
+                    "[CAPTCHA] Resultado aceptado y enviado al flujo de auth."
+                )
+                future.set_result(result)
+            else:
+                logger.warning(
+                    "[CAPTCHA] POST /send-data recibido pero el future ya estaba done. "
+                    "Resultado ignorado."
+                )
+
+            return web.Response(status=204)
+
+        except Exception as e:
+            logger.error("[CAPTCHA] Error procesando /send-data: {}", e)
+            return web.Response(status=500)
 
     app = web.Application()
     app.add_routes(router)
@@ -181,25 +272,39 @@ async def _launch_webapp(
     site = web.TCPSite(runner, host="localhost", port=port)
     await site.start()
 
-    print(f"\n[captcha] Abriendo http://localhost:{port} en el navegador...")
-    print("[captcha] Resuelve el captcha para continuar.\n")
+    logger.info(
+        "[CAPTCHA] Servidor iniciado en http://localhost:{}. "
+        "Abriendo navegador...", port
+    )
     webbrowser.open_new_tab(f"http://localhost:{port}")
 
     try:
         result = await asyncio.wait_for(future, timeout=300)
+        logger.info(
+            "[CAPTCHA] Captcha resuelto exitosamente. "
+            "challenge={} validate={} seccode={}",
+            result["geetest_challenge"],
+            result["geetest_validate"],
+            result["geetest_seccode"],
+        )
+        return result
+
     except asyncio.TimeoutError:
+        logger.error("[CAPTCHA] Timeout: el captcha no fue resuelto en 5 minutos.")
         raise RuntimeError(
             "El captcha no fue resuelto en 5 minutos. Intenta de nuevo."
         )
     finally:
-        # Pequeña pausa para que el browser reciba la respuesta 204
-        # antes de que el servidor se apague.
+        logger.debug("[CAPTCHA] Apagando servidor local...")
         await asyncio.sleep(0.3)
         await runner.shutdown()
         await runner.cleanup()
+        logger.debug("[CAPTCHA] Servidor apagado.")
 
-    return result
 
+# ---------------------------------------------------------------------------
+# Funciones publicas
+# ---------------------------------------------------------------------------
 
 async def solve_geetest(
     mmt: SessionMMT,
@@ -211,26 +316,30 @@ async def solve_geetest(
     """
     Resuelve un captcha Geetest abriendo el navegador del usuario.
 
-    Uso:
-        mmt_result = await solve_geetest(mmt_data)
-
-    Parámetros:
-        mmt         Datos del captcha devueltos por HoYoverse (SessionMMT).
+    Parametros:
+        mmt         Datos del captcha devueltos por HoYoverse.
         lang        Idioma del widget ('en', 'zh-cn', 'es', ...).
-        api_server  Servidor Geetest. Por defecto 'api-na.geetest.com' (global).
+        api_server  Servidor Geetest. Por defecto 'api-na.geetest.com'.
                     Para CN usar 'api.geetest.com'.
-        port        Puerto local del servidor temporal. Por defecto 5000.
+        port        Puerto local del servidor temporal.
 
     Lanza:
-        RuntimeError  Si el usuario no resuelve el captcha en 5 minutos.
+        RuntimeError  Si el captcha no se resuelve en 5 minutos.
     """
+    logger.debug(
+        "[CAPTCHA] solve_geetest() llamado. "
+        "lang={} api_server={} port={}",
+        lang, api_server, port
+    )
     return await _launch_webapp(mmt, lang=lang, api_server=api_server, port=port)
 
 
-async def enter_code(prompt: str = "Introduce el código de verificación: ") -> str:
+async def enter_code(prompt: str = "Introduce el codigo de verificacion: ") -> str:
     """
-    Solicita al usuario un código de verificación (email/SMS) por consola.
-
-    Es async para no bloquear el event loop mientras espera input del usuario.
+    Solicita al usuario un codigo de verificacion por consola.
+    Es async para no bloquear el event loop.
     """
-    return await asyncio.to_thread(input, prompt)
+    logger.debug("[CAPTCHA] Esperando codigo de verificacion del usuario...")
+    code = await asyncio.to_thread(input, prompt)
+    logger.debug("[CAPTCHA] Codigo introducido (longitud={}).", len(code))
+    return code

@@ -550,8 +550,13 @@ class AuthManager:
         logger.debug("[AUTH] Captcha OS resuelto: {}", mmt_result)
 
         mmt_type = captcha.get("mmt_type", 1)
-        headers["x-rpc-aigis"] = _build_aigis_header(mmt_result, mmt_type)
-        logger.debug("[AUTH] x-rpc-aigis construido con mmt_type={}. Reintentando login OS...", mmt_type)
+        aigis_header = _build_aigis_header(mmt_result, mmt_type)
+        headers["x-rpc-aigis"] = aigis_header
+        logger.debug(
+            "[AUTH] x-rpc-aigis construido con mmt_type={}: {}",
+            mmt_type, aigis_header
+        )
+        logger.debug("[AUTH] Reintentando login OS...")
         return await self._raw_post(_WEB_LOGIN_URL, payload, headers)
 
     async def _handle_captcha_cn(
@@ -579,8 +584,13 @@ class AuthManager:
         logger.debug("[AUTH] Captcha CN resuelto: {}", mmt_result)
 
         mmt_type = captcha.get("mmt_type", 1)
-        headers["x-rpc-aigis"] = _build_aigis_header(mmt_result, mmt_type)
-        logger.debug("[AUTH] Reintentando login CN con mmt_type={}...", mmt_type)
+        aigis_header = _build_aigis_header(mmt_result, mmt_type)
+        headers["x-rpc-aigis"] = aigis_header
+        logger.debug(
+            "[AUTH] x-rpc-aigis CN construido con mmt_type={}: {}",
+            mmt_type, aigis_header
+        )
+        logger.debug("[AUTH] Reintentando login CN...")
         return await self._raw_post(_CN_WEB_LOGIN_URL, payload, headers)
 
     # ------------------------------------------------------------------
@@ -780,19 +790,20 @@ def _build_aigis_header(mmt_result: SessionMMTResult, mmt_type: int = 1) -> str:
     """
     Construye el valor del header x-rpc-aigis a partir del resultado del captcha.
 
-    mmt_type debe coincidir con el mmt_type recibido en el aigis original
-    (normalmente 1 para Geetest v3). HoYoverse rechaza la solucion si falta.
+    Formato correcto segun genshin.py/utility/auth.py:
+        {session_id};{base64(json(mmt_data))}
+
+    NO es JSON — es session_id en texto plano, punto y coma,
+    y los datos del captcha codificados en base64.
     """
-    data = {
+    import base64
+    mmt_data = {
         "geetest_challenge": mmt_result["geetest_challenge"],
         "geetest_validate":  mmt_result["geetest_validate"],
         "geetest_seccode":   mmt_result["geetest_seccode"],
     }
-    return json.dumps({
-        "session_id": mmt_result["session_id"],
-        "mmt_type":   mmt_type,
-        "data":       json.dumps(data),
-    })
+    encoded = base64.b64encode(json.dumps(mmt_data).encode()).decode()
+    return f"{mmt_result['session_id']};{encoded}"
 
 
 def _raise_login_error(retcode: int, message: str) -> typing.NoReturn:

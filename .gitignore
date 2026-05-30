@@ -220,3 +220,4 @@ __marimo__/
 .vscode/
 test_output.txt
 error_log*.txt
+hoyo_auth.db

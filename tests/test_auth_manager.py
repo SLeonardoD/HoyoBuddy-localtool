@@ -138,8 +138,10 @@ class TestRegionFallback:
     @pytest.mark.asyncio
     async def test_falls_back_to_cn_if_os_fails(self, mock_store: MockCookieStore) -> None:
         """
-        Si el login OS falla con LoginError y no se especificó región,
-        AuthManager intenta CN automáticamente.
+        Si el login OS falla con error de credenciales y no se especifico region,
+        AuthManager intenta CN automaticamente.
+        El mensaje debe contener el retcode -3001 para que la condicion
+        de fallback lo reconozca como error de credenciales.
         """
         auth = AuthManager(mock_store)
 
@@ -148,7 +150,7 @@ class TestRegionFallback:
         async def mock_do_login(email, password, region):
             call_order.append(region)
             if region == "os":
-                raise LoginError("Credenciales incorrectas para OS.")
+                raise LoginError("[-3001] Cuenta o contrasena incorrectos.")
             return TEST_COOKIES_CN, TEST_DEVICE_ID
 
         with patch.object(auth, "_do_login", side_effect=mock_do_login):
@@ -157,16 +159,16 @@ class TestRegionFallback:
                 session = await auth.login(TEST_EMAIL, TEST_PASSWORD)
 
         assert "os" in call_order, (
-            f"Debería haber intentado OS primero. Orden: {call_order}"
+            f"Deberia haber intentado OS primero. Orden: {call_order}"
         )
         assert "cn" in call_order, (
-            f"Debería haber intentado CN como fallback. Orden: {call_order}"
+            f"Deberia haber intentado CN como fallback. Orden: {call_order}"
         )
         assert call_order.index("os") < call_order.index("cn"), (
-            f"OS debería intentarse antes que CN. Orden: {call_order}"
+            f"OS deberia intentarse antes que CN. Orden: {call_order}"
         )
         assert session.region == "cn", (
-            f"Sesión debería ser CN tras el fallback, obtenido: {session.region!r}"
+            f"Sesion deberia ser CN tras el fallback, obtenido: {session.region!r}"
         )
 
     @pytest.mark.asyncio
