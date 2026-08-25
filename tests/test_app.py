@@ -19,6 +19,7 @@ from app import (
     list_accounts,
     restore_session,
     run_daily_tasks,
+    redeem_code_for_all,
     _process_mimo_tasks,
     _process_mimo_buys,
 )
@@ -356,9 +357,199 @@ class TestRunDailyTasks:
         )
 
 
+
 # ---------------------------------------------------------------------------
-# Tests de _process_mimo_tasks
+# Tests de redeem_code_for_all
 # ---------------------------------------------------------------------------
+
+class TestRedeemCodeForAll:
+
+    @pytest.mark.asyncio
+    async def test_empty_accounts_returns_empty(self, ctx: AppContext) -> None:
+        """Sin cuentas registradas devuelve lista vacia."""
+        result = await redeem_code_for_all(ctx, "hk4e_global", "TESTCODE")
+        assert result == [], f"Sin cuentas deberia devolver [], obtenido: {result}"
+
+    @pytest.mark.asyncio
+    async def test_cn_accounts_skipped(self, ctx: AppContext) -> None:
+        """Cuentas CN se omiten — redeem solo disponible en OS."""
+        ctx.account_store.add("Cuenta CN", HASH_1, "cn")
+        result = await redeem_code_for_all(ctx, "hk4e_global", "TESTCODE")
+        assert result == [], (
+            "Cuentas CN deben omitirse del redeem. Obtenido: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_account_without_game_skipped(self) -> None:
+        """Cuenta OS que no tiene el juego objetivo no aparece en resultados."""
+        a_store = AccountStore(":memory:")
+        a_store.add("Cuenta OS", HASH_1, "os")
+        ctx = AppContext(
+            cookie_store=CookieStore(":memory:"),
+            account_store=a_store,
+            manager=MagicMock(),
+        )
+
+        mock_active = MagicMock(spec=ActiveSession)
+        mock_active.get_game = lambda biz: None  # no tiene hk4e_global
+
+        with patch("app.restore_session", new=AsyncMock(return_value=mock_active)):
+            result = await redeem_code_for_all(ctx, "hk4e_global", "TESTCODE")
+
+        assert result == [], (
+            "Cuenta sin el juego objetivo no debe aparecer en resultados."
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_redeem_reported(self) -> None:
+        """Canje exitoso se reporta con success=True."""
+        a_store = AccountStore(":memory:")
+        a_store.add("Cuenta OS", HASH_1, "os")
+        ctx = AppContext(
+            cookie_store=CookieStore(":memory:"),
+            account_store=a_store,
+            manager=MagicMock(),
+        )
+
+        mock_game = MagicMock()
+        mock_game.game_biz  = "hk4e_global"
+        mock_game.GAME_NAME = "Genshin Impact"
+        mock_game.uid       = "700000001"
+        mock_game.redeem_code = AsyncMock(return_value=None)
+
+        mock_active = MagicMock(spec=ActiveSession)
+        mock_active.games = [mock_game]
+        mock_active.get_game = lambda biz: mock_game if biz == "hk4e_global" else None
+
+        with patch("app.restore_session", new=AsyncMock(return_value=mock_active)):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await redeem_code_for_all(ctx, "hk4e_global", "ABCD1234")
+
+        assert len(result) == 1, f"Esperado 1 resultado, obtenidos: {len(result)}"
+        assert result[0]["success"] is True, (
+            f"Canje exitoso deberia tener success=True. Resultado: {result[0]}"
+        )
+        assert result[0]["alias"] == "Cuenta OS"
+        assert result[0]["uid"]   == "700000001"
+        mock_game.redeem_code.assert_called_once_with("ABCD1234", lang="en")
+
+    @pytest.mark.asyncio
+    async def test_api_error_reported_as_failure(self) -> None:
+        """Error de la API se reporta con success=False sin propagarse."""
+        a_store = AccountStore(":memory:")
+        a_store.add("Cuenta OS", HASH_1, "os")
+        ctx = AppContext(
+            cookie_store=CookieStore(":memory:"),
+            account_store=a_store,
+            manager=MagicMock(),
+        )
+
+        mock_game = MagicMock()
+        mock_game.game_biz  = "hk4e_global"
+        mock_game.GAME_NAME = "Genshin Impact"
+        mock_game.uid       = "700000001"
+        mock_game.redeem_code = AsyncMock(
+            side_effect=HoyoAPIError(-2017, "Code already used", {})
+        )
+
+        mock_active = MagicMock(spec=ActiveSession)
+        mock_active.get_game = lambda biz: mock_game if biz == "hk4e_global" else None
+
+        with patch("app.restore_session", new=AsyncMock(return_value=mock_active)):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await redeem_code_for_all(ctx, "hk4e_global", "USEDCODE")
+
+        assert len(result) == 1
+        assert result[0]["success"] is False, (
+            "Error de API deberia reportarse como success=False."
+        )
+        assert "-2017" in result[0]["message"], (
+            f"El retcode deberia aparecer en el mensaje. Obtenido: {result[0]['message']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_multiple_accounts_all_receive_code(self) -> None:
+        """Con dos cuentas que tienen el juego, el codigo se canjea en ambas."""
+        a_store = AccountStore(":memory:")
+        a_store.add("Cuenta A", HASH_1,    "os")
+        a_store.add("Cuenta B", "b" * 64,  "os")
+        ctx = AppContext(
+            cookie_store=CookieStore(":memory:"),
+            account_store=a_store,
+            manager=MagicMock(),
+        )
+
+        def make_game(uid: str) -> MagicMock:
+            g = MagicMock()
+            g.game_biz  = "hk4e_global"
+            g.GAME_NAME = "Genshin Impact"
+            g.uid       = uid
+            g.redeem_code = AsyncMock(return_value=None)
+            return g
+
+        game_a = make_game("700000001")
+        game_b = make_game("700000002")
+
+        sessions = [
+            MagicMock(spec=ActiveSession, get_game=lambda biz, g=game_a: g if biz == "hk4e_global" else None),
+            MagicMock(spec=ActiveSession, get_game=lambda biz, g=game_b: g if biz == "hk4e_global" else None),
+        ]
+        call_count = {"n": 0}
+
+        async def mock_restore(ctx, account):
+            s = sessions[call_count["n"]]
+            call_count["n"] += 1
+            return s
+
+        with patch("app.restore_session", side_effect=mock_restore):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await redeem_code_for_all(ctx, "hk4e_global", "MULTICODE")
+
+        assert len(result) == 2, (
+            f"Deberian aparecer 2 resultados (uno por cuenta). Obtenidos: {len(result)}"
+        )
+        assert all(r["success"] for r in result), (
+            f"Ambos canjes deberian ser exitosos. Resultados: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_expired_session_skipped_gracefully(self) -> None:
+        """Cuenta con sesion expirada se omite sin afectar a las demas."""
+        a_store = AccountStore(":memory:")
+        a_store.add("Expirada", HASH_1,   "os")
+        a_store.add("Valida",   "b"*64,   "os")
+        ctx = AppContext(
+            cookie_store=CookieStore(":memory:"),
+            account_store=a_store,
+            manager=MagicMock(),
+        )
+
+        mock_game = MagicMock()
+        mock_game.game_biz  = "hk4e_global"
+        mock_game.GAME_NAME = "Genshin Impact"
+        mock_game.uid       = "700000002"
+        mock_game.redeem_code = AsyncMock(return_value=None)
+
+        mock_active = MagicMock(spec=ActiveSession)
+        mock_active.get_game = lambda biz: mock_game if biz == "hk4e_global" else None
+
+        sessions = [None, mock_active]  # Primera expirada, segunda valida
+        call_count = {"n": 0}
+
+        async def mock_restore(ctx, account):
+            s = sessions[call_count["n"]]
+            call_count["n"] += 1
+            return s
+
+        with patch("app.restore_session", side_effect=mock_restore):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await redeem_code_for_all(ctx, "hk4e_global", "TESTCODE")
+
+        assert len(result) == 1, (
+            f"Solo la cuenta valida deberia aparecer. Resultados: {result}"
+        )
+        assert result[0]["success"] is True
+
 
 class TestProcessMimoTasks:
 
@@ -372,14 +563,21 @@ class TestProcessMimoTasks:
 
     @pytest.mark.asyncio
     async def test_claims_completed_tasks(self) -> None:
-        """Reclama tareas con status=1 y las reporta como exitosas."""
+        """
+        Reclama tareas con status=1 (FINISHED) y reporta como pendiente
+        las de status=2 (ONGOING) que requieren accion en juego (task_type=6).
+
+        Status segun genshin.py: 1=FINISHED, 2=ONGOING, 3=CLAIMED.
+        task_type=6 (GI_GAME) requiere accion en juego — no completable via API.
+        """
         game = MagicMock()
         game.GAME_NAME = "Genshin Impact"
         game.get_mimo_tasks = AsyncMock(return_value=[
-            {"task_id": 1, "name": "Iniciar sesion", "status": 1},
-            {"task_id": 2, "name": "Explorar mapa",  "status": 0},
+            {"task_id": 1, "task_name": "Iniciar sesion", "status": 1, "task_type": 5},
+            {"task_id": 2, "task_name": "Explorar mapa",  "status": 2, "task_type": 6},
         ])
         game.claim_mimo_task_reward = AsyncMock(return_value=None)
+        game.finish_mimo_task = AsyncMock(return_value=None)
 
         result = await _process_mimo_tasks(game)
 
@@ -397,13 +595,40 @@ class TestProcessMimoTasks:
         )
 
     @pytest.mark.asyncio
+    async def test_finishes_and_claims_web_completable_tasks(self) -> None:
+        """
+        Tareas ONGOING con task_type completable via API (tipo 2=VISIT)
+        se completan con finish_mimo_task() y luego se reclaman.
+        """
+        game = MagicMock()
+        game.GAME_NAME = "Honkai: Star Rail"
+        game.get_mimo_tasks = AsyncMock(return_value=[
+            {"task_id": 10, "task_name": "Visitar grupo", "status": 2, "task_type": 2},
+        ])
+        game.finish_mimo_task = AsyncMock(return_value=None)
+        game.claim_mimo_task_reward = AsyncMock(return_value=None)
+
+        result = await _process_mimo_tasks(game)
+
+        game.finish_mimo_task.assert_called_once_with(10)
+        game.claim_mimo_task_reward.assert_called_once_with(10)
+
+        claimed = [r for r in result if r["success"] is True]
+        assert len(claimed) == 1, (
+            f"Deberia haberse reclamado 1 tarea tras finish. "
+            f"Resultados: {result}"
+        )
+        assert claimed[0]["detail"] == "Visitar grupo"
+
+    @pytest.mark.asyncio
     async def test_handles_claim_error(self) -> None:
         """Si claim_mimo_task_reward falla, el error se reporta sin propagarse."""
         game = MagicMock()
         game.GAME_NAME = "Honkai: Star Rail"
         game.get_mimo_tasks = AsyncMock(return_value=[
-            {"task_id": 5, "name": "Tarea fallida", "status": 1},
+            {"task_id": 5, "task_name": "Tarea fallida", "status": 1, "task_type": 5},
         ])
+        game.finish_mimo_task = AsyncMock(return_value=None)
         game.claim_mimo_task_reward = AsyncMock(
             side_effect=HoyoAPIError(-100, "Error al reclamar", {})
         )

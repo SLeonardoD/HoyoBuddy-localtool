@@ -221,3 +221,4 @@ __marimo__/
 test_output.txt
 error_log*.txt
 hoyo_auth.db
+*.db

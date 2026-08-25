@@ -336,14 +336,19 @@ class TestMimoSupport:
 
 class TestMimoUrls:
 
-    def test_genshin_mimo_url_uses_qiuqiu_prefix(self, genshin: GenshinGame) -> None:
+    def test_genshin_mimo_url_uses_nata_prefix(self, genshin: GenshinGame) -> None:
         """
-        Genshin (GAME_ID=2) usa /qiuqiu/ en las URLs del mimo.
-        Usar la URL estándar para Genshin devuelve 404 o error de la API.
+        Genshin (GAME_ID=2) usa /nata/ en las URLs del mimo.
+        Usar la URL estandar para Genshin devuelve 404 o error de la API.
+        Fuente: genshin.py/hoyolab.py/_request_mimo()
         """
         url = genshin._mimo_url("task-list")
-        assert "/qiuqiu/" in url, (
-            f"URL de mimo de Genshin debería contener '/qiuqiu/'.\n"
+        assert "/nata/" in url, (
+            f"URL de mimo de Genshin deberia contener '/nata/'.\n"
+            f"  Obtenido: {url!r}"
+        )
+        assert "/qiuqiu/" not in url, (
+            f"URL de mimo de Genshin ya no debe usar '/qiuqiu/' (obsoleto).\n"
             f"  Obtenido: {url!r}"
         )
         assert _MIMO_BASE_URL in url, (
@@ -359,27 +364,39 @@ class TestMimoUrls:
         """
         url = genshin._mimo_url("task-list")
         assert "task_list" in url, (
-            f"Genshin debería convertir 'task-list' → 'task_list'.\n"
+            f"Genshin deberia convertir 'task-list' a 'task_list'.\n"
             f"  Obtenido: {url!r}"
         )
         assert "task-list" not in url, (
-            f"Genshin no debería tener guiones en el endpoint.\n"
+            f"Genshin no deberia tener guiones en el endpoint.\n"
+            f"  Obtenido: {url!r}"
+        )
+        assert "/nata/" in url, (
+            f"Genshin deberia usar el prefijo '/nata/'.\n"
             f"  Obtenido: {url!r}"
         )
 
-    def test_starrail_mimo_url_no_qiuqiu(self, starrail: StarRailGame) -> None:
-        """StarRail NO usa /qiuqiu/ — usa la ruta estándar."""
+    def test_starrail_mimo_url_no_nata(self, starrail: StarRailGame) -> None:
+        """StarRail NO usa /nata/ — usa la ruta estandar directa."""
         url = starrail._mimo_url("task-list")
+        assert "/nata/" not in url, (
+            f"StarRail no deberia usar '/nata/' en el mimo.\n"
+            f"  Obtenido: {url!r}"
+        )
         assert "/qiuqiu/" not in url, (
-            f"StarRail no debería usar '/qiuqiu/' en el mimo.\n"
+            f"StarRail no deberia usar '/qiuqiu/' en el mimo.\n"
             f"  Obtenido: {url!r}"
         )
 
-    def test_zzz_mimo_url_no_qiuqiu(self, zzz: ZZZGame) -> None:
-        """ZZZ NO usa /qiuqiu/ — usa la ruta estándar."""
+    def test_zzz_mimo_url_no_nata(self, zzz: ZZZGame) -> None:
+        """ZZZ NO usa /nata/ — usa la ruta estandar directa."""
         url = zzz._mimo_url("exchange-list")
+        assert "/nata/" not in url, (
+            f"ZZZ no deberia usar '/nata/' en el mimo.\n"
+            f"  Obtenido: {url!r}"
+        )
         assert "/qiuqiu/" not in url, (
-            f"ZZZ no debería usar '/qiuqiu/' en el mimo.\n"
+            f"ZZZ no deberia usar '/qiuqiu/' en el mimo.\n"
             f"  Obtenido: {url!r}"
         )
 

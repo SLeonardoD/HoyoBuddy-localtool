@@ -22,6 +22,7 @@ Dependencias inyectadas (no se crean aqui):
 from __future__ import annotations
 
 import asyncio
+import random
 import typing
 
 from loguru import logger
@@ -39,9 +40,12 @@ __all__ = [
     "list_accounts",
     "restore_session",
     "run_daily_tasks",
+    "redeem_code_for_all",
+    "REDEEMABLE_GAMES",
     "TaskResult",
     "AccountResult",
     "DailyRunResult",
+    "RedeemResult",
 ]
 
 # URLs de canje de codigos por juego (para mostrar al usuario tras compra mimo)
@@ -396,15 +400,34 @@ async def _process_account_games(
 
 
 async def _process_mimo_tasks(game) -> list[TaskResult]:
-    """Reclama recompensas de tareas mimo completadas (status=1)."""
+    """
+    Procesa tareas mimo completo:
+      1. Tareas completables via API (VISIT, VIEW_TOPIC, TRAILER, etc.)
+         -> finish_mimo_task() primero, luego claim.
+      2. Tareas ya completadas (status=1/FINISHED)
+         -> claim_mimo_task_reward() directamente.
+      3. Tareas pendientes que requieren accion en juego
+         -> reportar al usuario.
+      4. Tareas ya reclamadas (status=3/CLAIMED)
+         -> ignorar silenciosamente.
+
+    Status segun genshin.py/models/hoyolab/mimo.py:
+        1 = FINISHED (completada, sin reclamar)
+        2 = ONGOING  (en progreso / pendiente)
+        3 = CLAIMED  (ya reclamada)
+    """
+    from HoyoWrapper.game_model import MIMO_FINISHABLE_TASK_TYPES
+
     results: list[TaskResult] = []
 
     try:
         tasks = await game.get_mimo_tasks()
     except NotImplementedError:
-        return []  # Honkai o CN: sin mimo
+        return []
     except HoyoAPIError as e:
-        logger.warning("    [Mimo tasks] Error al obtener tareas: {}", e)
+        logger.warning(
+            "[APP] Error al obtener tareas mimo | game={} error={}", game.GAME_NAME, e
+        )
         return [{
             "type":      "mimo_task",
             "game_name": game.GAME_NAME,
@@ -413,25 +436,71 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
             "detail":    "",
         }]
 
-    # status: 0=pendiente, 1=completada(sin reclamar), 2=reclamada
-    completed   = [t for t in tasks if t.get("status") == 1]
-    pending     = [t for t in tasks if t.get("status") == 0]
-    already     = [t for t in tasks if t.get("status") == 2]
+    # Clasificar por status
+    finished = [t for t in tasks if t.get("status") == 1]
+    ongoing  = [t for t in tasks if t.get("status") == 2]
+    claimed  = [t for t in tasks if t.get("status") == 3]
+
+    # Clasificar ongoing por tipo
+    finishable_via_api = [
+        t for t in ongoing
+        if (t.get("task_type") or t.get("type")) in MIMO_FINISHABLE_TASK_TYPES
+    ]
+    requires_game = [
+        t for t in ongoing
+        if (t.get("task_type") or t.get("type")) not in MIMO_FINISHABLE_TASK_TYPES
+    ]
 
     logger.info(
-        "    [Mimo tasks] Total: {} | Reclamables: {} | Pendientes: {} | Ya reclamadas: {}",
-        len(tasks), len(completed), len(pending), len(already)
+        "[APP] Mimo tareas | game={} total={} completadas={} "
+        "finishable_api={} requieren_juego={} ya_reclamadas={}",
+        game.GAME_NAME, len(tasks), len(finished),
+        len(finishable_via_api), len(requires_game), len(claimed)
     )
 
-    # Reclamar las completadas
-    for task in completed:
+    # Paso 1: completar via API las que se pueden
+    for task in finishable_via_api:
         task_id   = task.get("task_id") or task.get("id")
-        task_name = task.get("name") or task.get("title") or f"Tarea #{task_id}"
-        await asyncio.sleep(0.5)  # pequeno delay entre claims
+        task_name = task.get("task_name") or task.get("name") or f"Tarea #{task_id}"
+        task_type = task.get("task_type") or task.get("type")
+
+        await asyncio.sleep(round(random.uniform(0.8, 2.0), 2))
+
+        try:
+            await game.finish_mimo_task(task_id)
+            logger.info(
+                "[APP] Tarea completada via API | game={} task={!r} type={}",
+                game.GAME_NAME, task_name, task_type
+            )
+            # Añadir a finished para reclamar en el paso 2
+            finished.append(task)
+        except HoyoAPIError as e:
+            logger.warning(
+                "[APP] No se pudo completar tarea | game={} task={!r} "
+                "retcode={} message={!r}",
+                game.GAME_NAME, task_name, e.retcode, e.message
+            )
+            results.append({
+                "type":      "mimo_task",
+                "game_name": game.GAME_NAME,
+                "success":   False,
+                "message":   f"No se pudo completar: {e.message}",
+                "detail":    task_name,
+            })
+
+    # Paso 2: reclamar todas las completadas
+    for task in finished:
+        task_id   = task.get("task_id") or task.get("id")
+        task_name = task.get("task_name") or task.get("name") or f"Tarea #{task_id}"
+
+        await asyncio.sleep(round(random.uniform(0.8, 2.0), 2))
 
         try:
             await game.claim_mimo_task_reward(task_id)
-            logger.success("    [Mimo] Reclamada: {}", task_name)
+            logger.info(
+                "[APP] Recompensa reclamada | game={} task={!r}",
+                game.GAME_NAME, task_name
+            )
             results.append({
                 "type":      "mimo_task",
                 "game_name": game.GAME_NAME,
@@ -440,7 +509,11 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
                 "detail":    task_name,
             })
         except HoyoAPIError as e:
-            logger.warning("    [Mimo] Error al reclamar '{}': {}", task_name, e)
+            logger.warning(
+                "[APP] Error al reclamar | game={} task={!r} "
+                "retcode={} message={!r}",
+                game.GAME_NAME, task_name, e.retcode, e.message
+            )
             results.append({
                 "type":      "mimo_task",
                 "game_name": game.GAME_NAME,
@@ -449,10 +522,14 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
                 "detail":    task_name,
             })
 
-    # Registrar las pendientes (informacion para el usuario)
-    for task in pending:
-        task_name = task.get("name") or task.get("title") or f"Tarea #{task.get('task_id')}"
-        logger.info("    [Mimo] Pendiente (completar en juego): {}", task_name)
+    # Paso 3: reportar pendientes que requieren accion en juego
+    for task in requires_game:
+        task_name = task.get("task_name") or task.get("name") or f"Tarea #{task.get('task_id')}"
+        task_type = task.get("task_type") or task.get("type")
+        logger.info(
+            "[APP] Tarea pendiente (requiere juego) | game={} task={!r} type={}",
+            game.GAME_NAME, task_name, task_type
+        )
         results.append({
             "type":      "mimo_task",
             "game_name": game.GAME_NAME,
@@ -501,5 +578,138 @@ async def _process_mimo_buys(game) -> list[TaskResult]:
             "message":   f"Compra exitosa: {item_name}",
             "detail":    f"Codigo: {code} | Canjear en: {redeem_url}",
         })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Juegos que soportan canje de codigos (para el menu de seleccion)
+# Solo OS — CN no soportado via API
+# ---------------------------------------------------------------------------
+
+REDEEMABLE_GAMES: list[dict] = [
+    {"display": "Genshin Impact",    "game_biz": "hk4e_global"},
+    {"display": "Honkai: Star Rail", "game_biz": "hkrpg_global"},
+    {"display": "Zenless Zone Zero", "game_biz": "nap_global"},
+]
+
+
+class RedeemResult(typing.TypedDict):
+    """Resultado del canje de un codigo en una cuenta."""
+    alias:     str
+    game_name: str
+    uid:       str
+    success:   bool
+    message:   str
+
+
+async def redeem_code_for_all(
+    ctx: AppContext,
+    game_biz: str,
+    code: str,
+    *,
+    lang: str = "en",
+) -> list[RedeemResult]:
+    """
+    Canjea un codigo de regalo en todas las cuentas que tengan el juego indicado.
+
+    Flujo por cuenta:
+      1. Restaurar sesion desde cookies guardadas.
+      2. Buscar el juego objetivo entre los juegos activos de la cuenta.
+      3. Si lo tiene y esta habilitado, intentar redeem_code().
+      4. Delay aleatorio entre cuentas (anti-deteccion).
+         HoYoverse impone un cooldown entre redeems — usamos 6-10s.
+
+    Solo opera en cuentas de region OS. CN no soporta redeem via API.
+
+    Devuelve lista de RedeemResult, uno por cuenta que tenga el juego.
+    """
+    accounts = ctx.account_store.list_all()
+    if not accounts:
+        logger.info("[REDEEM] No hay cuentas registradas.")
+        return []
+
+    os_accounts = [a for a in accounts if a["region"] == "os"]
+    if not os_accounts:
+        logger.warning(
+            "[REDEEM] Ninguna cuenta OS registrada. "
+            "El canje de codigos solo esta disponible en region OS."
+        )
+        return []
+
+    results: list[RedeemResult] = []
+    found_any = False
+
+    for i, account in enumerate(os_accounts):
+        if i > 0:
+            # Cooldown entre redeems — HoYoverse lo requiere
+            await random_delay(6.0, 10.0)
+
+        alias = account["alias"]
+        logger.info("[REDEEM] Revisando cuenta: {}", alias)
+
+        active = await restore_session(ctx, account)
+        if active is None:
+            logger.warning(
+                "[REDEEM] Sesion expirada para '{}'. "
+                "Vuelve a registrar la cuenta con 'Agregar cuenta'.", alias
+            )
+            continue
+
+        target_game = active.get_game(game_biz)
+        if target_game is None:
+            logger.debug(
+                "[REDEEM] '{}' no tiene {} — omitiendo.", alias, game_biz
+            )
+            continue
+
+        found_any = True
+        logger.info(
+            "[REDEEM] '{}' tiene {} (uid={}). Intentando canje del codigo '{}'...",
+            alias, target_game.GAME_NAME, target_game.uid, code
+        )
+
+        try:
+            await target_game.redeem_code(code, lang=lang)
+            logger.success(
+                "[REDEEM] Canjeado en '{}' ({} uid={}).",
+                alias, target_game.GAME_NAME, target_game.uid
+            )
+            results.append({
+                "alias":     alias,
+                "game_name": target_game.GAME_NAME,
+                "uid":       target_game.uid,
+                "success":   True,
+                "message":   "Codigo canjeado correctamente.",
+            })
+        except NotImplementedError as e:
+            logger.warning(
+                "[REDEEM] {} no soporta redeem via API: {}", target_game.GAME_NAME, e
+            )
+            results.append({
+                "alias":     alias,
+                "game_name": target_game.GAME_NAME,
+                "uid":       target_game.uid,
+                "success":   False,
+                "message":   str(e),
+            })
+        except HoyoAPIError as e:
+            logger.error(
+                "[REDEEM] Error en '{}' ({} uid={}) — retcode={} message={!r}",
+                alias, target_game.GAME_NAME, target_game.uid,
+                e.retcode, e.message
+            )
+            results.append({
+                "alias":     alias,
+                "game_name": target_game.GAME_NAME,
+                "uid":       target_game.uid,
+                "success":   False,
+                "message":   f"[{e.retcode}] {e.message}",
+            })
+
+    if not found_any:
+        logger.info(
+            "[REDEEM] Ninguna cuenta registrada tiene el juego {}.", game_biz
+        )
 
     return results

@@ -31,6 +31,8 @@ from app import (
     list_accounts,
     restore_session,
     run_daily_tasks,
+    redeem_code_for_all,
+    REDEEMABLE_GAMES,
 )
 
 # ---------------------------------------------------------------------------
@@ -84,6 +86,7 @@ def _print_menu() -> None:
     print("  2. Listar cuentas")
     print("  3. Eliminar cuenta")
     print("  4. Completar tareas diarias")
+    print("  5. Canjear codigo de regalo")
     print("  0. Salir")
     print(SEP)
 
@@ -304,6 +307,78 @@ def _print_daily_summary(result: dict) -> None:
     print(SEP)
 
 
+async def _action_redeem(ctx: AppContext) -> None:
+    """Flujo de canje de codigo de regalo en todas las cuentas que tengan el juego."""
+    print(f"\n{SEP}")
+    print("  CANJEAR CODIGO DE REGALO")
+    print(SEP)
+
+    accounts = list_accounts(ctx)
+    os_accounts = [a for a in accounts if a["region"] == "os"]
+    if not os_accounts:
+        print("\n  No hay cuentas OS registradas.")
+        print("  El canje de codigos solo esta disponible en region OS (HoYoLab).")
+        return
+
+    # Seleccion de juego
+    print("\n  Selecciona el juego al que pertenece el codigo:\n")
+    for i, game in enumerate(REDEEMABLE_GAMES, 1):
+        print(f"    {i}. {game['display']}")
+    print()
+
+    game_input = _ask("Numero de juego (o Enter para cancelar): ")
+    if not game_input:
+        return
+
+    try:
+        game_idx = int(game_input) - 1
+        if not (0 <= game_idx < len(REDEEMABLE_GAMES)):
+            raise ValueError
+    except ValueError:
+        print("  Opcion no valida.")
+        return
+
+    selected = REDEEMABLE_GAMES[game_idx]
+    game_biz  = selected["game_biz"]
+    game_name = selected["display"]
+
+    # Pedir codigo
+    print()
+    code = _ask(f"Codigo de {game_name}: ").upper().strip()
+    if not code:
+        print("  Operacion cancelada.")
+        return
+
+    print()
+    logger.info(
+        "Canjeando codigo '{}' para {} en {} cuenta(s) OS...",
+        code, game_name, len(os_accounts)
+    )
+
+    results = await redeem_code_for_all(ctx, game_biz, code)
+
+    # Mostrar resumen
+    print(f"\n{SEP}")
+    print("  RESULTADO DEL CANJE")
+    print(SEP)
+
+    if not results:
+        print(f"\n  Ninguna cuenta registrada tiene {game_name}.")
+        return
+
+    ok  = [r for r in results if r["success"]]
+    err = [r for r in results if not r["success"]]
+
+    for r in results:
+        icon = "OK" if r["success"] else "--"
+        print(f"\n  [{icon}] {r['alias']} | {r['game_name']} (uid: {r['uid']})")
+        print(f"       {r['message']}")
+
+    print(f"\n{SEP}")
+    print(f"  Canjeado en: {len(ok)} cuenta(s)  |  Fallido en: {len(err)} cuenta(s)")
+    print(SEP)
+
+
 # ---------------------------------------------------------------------------
 # Bucle principal
 # ---------------------------------------------------------------------------
@@ -334,12 +409,15 @@ async def run() -> None:
         elif choice == "4":
             await _action_run_daily(ctx)
 
+        elif choice == "5":
+            await _action_redeem(ctx)
+
         elif choice == "0":
             print("\n  Hasta luego.\n")
             break
 
         else:
-            print("  Opcion no valida. Elige entre 0 y 4.")
+            print("  Opcion no valida. Elige entre 0 y 5.")
 
 
 def main() -> None:
