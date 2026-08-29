@@ -13,7 +13,11 @@ No contiene logica de DB. CookieStore se recibe por inyeccion.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import random
+import string
+import time
 import typing
 import uuid
 
@@ -49,6 +53,33 @@ _VERIFY_EMAIL_URL = (
     "https://sg-public-api.hoyoverse.com/account/ma-verifier/api"
     "/verifyActionTicketPartly"
 )
+# Intercambio stoken_v2 + ltmid_v2 -> cookie_token_v2 (+ ltoken_v2).
+# Requerido porque redeem_code() en genshin.py exige cookie_token o
+# cookie_token_v2 (ver managers.requires_cookie_token); /webLoginByPassword
+# NO lo entrega, solo ltoken_v2/ltuid_v2/stoken.
+# Verificado contra genshin.py: client/routes.py -> COOKIE_V2_REFRESH_URL,
+# client/manager/cookie.py -> fetch_cookie_with_stoken_v2().
+_COOKIE_V2_REFRESH_URL = (
+    "https://sg-public-api.hoyoverse.com/account/ma-passport/token/getBySToken"
+)
+# Salt DS para este endpoint especifico (distinto del DS de check-in/mimo).
+# Verificado contra genshin.py: constants.py -> DS_SALT["app_login"].
+_DS_SALT_APP_LOGIN = "IZPgfb0dRPtBeLuFkdDznSZ6f4wWt6y2"
+
+
+def _generate_app_login_ds() -> str:
+    """
+    Genera el header 'ds' (dynamic secret) para el endpoint getBySToken.
+
+    Formato "t,r,md5(salt=...&t=...&r=...)" sin body/query — replica
+    genshin.py: utility/ds.py -> generate_dynamic_secret(). NO confundir
+    con generate_app_login_ds() de genshin.py (esa incluye el body en el
+    hash y es para OTRO endpoint de login por app, no para este).
+    """
+    t = int(time.time())
+    r = "".join(random.choices(string.ascii_letters, k=6))
+    h = hashlib.md5(f"salt={_DS_SALT_APP_LOGIN}&t={t}&r={r}".encode()).hexdigest()
+    return f"{t},{r},{h}"
 
 _RSA_KEY_1 = (
     "-----BEGIN PUBLIC KEY-----\n"
@@ -236,6 +267,39 @@ class AuthManager:
                 session = HoyoSession(cookies, r, device_id)
                 if await self._validate_session(session):
                     logger.info("[AUTH] Sesion restaurada desde store ({}).", r)
+
+                    # Auto-reparacion: cuentas logueadas antes de que se
+                    # agregara el intercambio stoken -> cookie_token_v2
+                    # tendrian redeem_code roto (-1071) para siempre si no
+                    # se completa esto aca.
+                    if (
+                        r == "os"
+                        and cookies.get("stoken")
+                        and "cookie_token_v2" not in cookies
+                    ):
+                        if not cookies.get("ltmid_v2"):
+                            logger.warning(
+                                "[AUTH] Sesion sin cookie_token_v2 y sin "
+                                "ltmid_v2 — no se puede auto-reparar. "
+                                "redeem_code seguira fallando con -1071 "
+                                "para esta cuenta hasta un re-login manual "
+                                "(opcion 1 del menu)."
+                            )
+                        else:
+                            logger.info(
+                                "[AUTH] Sesion sin cookie_token_v2 (sesion "
+                                "previa al fix de redeem). Reparando..."
+                            )
+                            extra = await self._fetch_cookie_token(cookies)
+                            if extra:
+                                cookies.update(extra)
+                                self._store.set(email, r, cookies, device_id)
+                                session = HoyoSession(cookies, r, device_id)
+                                logger.info(
+                                    "[AUTH] cookie_token_v2 reparado y "
+                                    "persistido."
+                                )
+
                     return session
                 logger.info(
                     "[AUTH] Cookies expiradas para region={}. "
@@ -351,6 +415,14 @@ class AuthManager:
             cookies["stoken"] = resp["data"]["stoken"]
             logger.debug("[AUTH] stoken añadido a cookies OS.")
 
+            # cookie_token_v2 no llega en /webLoginByPassword — hay que
+            # canjear el stoken (+ ltmid_v2) por el en un endpoint separado.
+            # Sin esto redeem_code() falla con -1071 aunque check-in/mimo
+            # funcionen perfecto (esos no lo necesitan).
+            if "cookie_token_v2" not in cookies:
+                extra = await self._fetch_cookie_token(cookies)
+                cookies.update(extra)
+
         if not cookies:
             logger.error(
                 "[AUTH] Login OS retcode=0 pero sin cookies. "
@@ -361,6 +433,117 @@ class AuthManager:
 
         logger.info("[AUTH] _os_login_flow completado. Cookies: {}", list(cookies.keys()))
         return cookies, device_id
+
+    async def _fetch_cookie_token(
+        self, cookies: dict[str, str]
+    ) -> dict[str, str]:
+        """
+        Intercambia stoken (v2) + ltmid_v2 por cookie_token_v2 (y ltoken_v2).
+
+        Replica fetch_cookie_with_stoken_v2() de genshin.py
+        (genshin/client/manager/cookie.py), verificado leyendo el codigo
+        fuente instalado via pip. Detalles NO obvios y criticos:
+          - URL: COOKIE_V2_REFRESH_URL ("...hoyoverse.com/.../getBySToken"),
+            NO el dominio hoyolab.com ni un endpoint estilo mihoyo.com/CN.
+          - Metodo POST con body {"dst_token_types": [2, 4]} — NO son
+            query params ni GET.
+          - Requiere header 'ds' (dynamic secret) con el salt especifico
+            DS_SALT["app_login"], generado SIN incluir el body en el hash
+            (formato simple t,r,md5(salt&t&r) — distinto del ds usado en
+            checkin/mimo que sí incluye body/query).
+          - Requiere la cookie 'ltmid_v2' renombrada a 'mid' en el request
+            (el endpoint no reconoce 'ltmid_v2', solo 'mid').
+          - La respuesta trae una LISTA data.tokens, cada uno con
+            token_type (2=ltoken_v2, 4=cookie_token_v2) y token (el valor).
+
+        Necesario porque redeem_code() en genshin.py (via
+        @managers.requires_cookie_token) exige cookie_token o
+        cookie_token_v2 en las cookies. /webLoginByPassword NO lo entrega
+        — solo ltoken_v2/ltuid_v2/stoken(/ltmid_v2). Sin este intercambio,
+        redeem falla con retcode=-1071 "Please log in to your account
+        first" aunque check-in/mimo funcionen perfecto (esos no lo
+        necesitan).
+
+        No lanza si falla: loguea el error y devuelve {} para no romper
+        un login por lo demas exitoso. redeem_code seguira fallando en
+        ese caso puntual, pero el resto del wrapper sigue operativo.
+        """
+        if "stoken" not in cookies:
+            logger.error(
+                "[AUTH] No se puede pedir cookie_token_v2: falta 'stoken' "
+                "en las cookies del login."
+            )
+            return {}
+
+        if "ltmid_v2" not in cookies:
+            logger.error(
+                "[AUTH] No se puede pedir cookie_token_v2: falta 'ltmid_v2' "
+                "en las cookies devueltas por webLoginByPassword. Revisar "
+                "el log '[AUTH] Cookies OS recibidas' para confirmar si "
+                "HoYoverse dejo de mandar este campo — sin el, este "
+                "intercambio no es posible y redeem_code seguira fallando."
+            )
+            return {}
+
+        request_cookies = dict(cookies)
+        request_cookies["mid"] = request_cookies["ltmid_v2"]
+
+        headers = {
+            "User-Agent":    _USER_AGENT,
+            "ds":            _generate_app_login_ds(),
+            "x-rpc-app_id":  "c9oqaq3s3gu8",
+        }
+        body = {"dst_token_types": [2, 4]}
+
+        logger.debug("[AUTH] Solicitando cookie_token_v2 via getBySToken...")
+        try:
+            async with aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar()
+            ) as s:
+                async with s.post(
+                    _COOKIE_V2_REFRESH_URL,
+                    json=body,
+                    headers=headers,
+                    cookies=request_cookies,
+                ) as resp:
+                    data = await resp.json(content_type=None)
+        except aiohttp.ClientError as e:
+            logger.error(
+                "[AUTH] Error de red al pedir cookie_token_v2: {}", e
+            )
+            return {}
+
+        retcode = data.get("retcode", 0)
+        if retcode != 0:
+            logger.error(
+                "[AUTH] getBySToken fallo. retcode={} message={!r} — "
+                "redeem_code no funcionara hasta resolver esto. "
+                "Verificar salt DS_SALT['app_login'] y formato del ds "
+                "contra genshin.py actualizado si el retcode indica "
+                "firma invalida.",
+                retcode, data.get("message", "")
+            )
+            return {}
+
+        tokens = (data.get("data") or {}).get("tokens", [])
+        result: dict[str, str] = {}
+        for tok in tokens:
+            if tok.get("token_type") == 2:
+                result["ltoken_v2"] = tok["token"]
+            elif tok.get("token_type") == 4:
+                result["cookie_token_v2"] = tok["token"]
+
+        if "cookie_token_v2" not in result:
+            logger.error(
+                "[AUTH] getBySToken retcode=0 pero sin token_type=4 "
+                "(cookie_token_v2) en la respuesta. tokens={}", tokens
+            )
+            return {}
+
+        logger.info(
+            "[AUTH] cookie_token_v2 obtenido correctamente via getBySToken."
+        )
+        return result
 
     async def _cn_login_flow(
         self, email: str, password: str
