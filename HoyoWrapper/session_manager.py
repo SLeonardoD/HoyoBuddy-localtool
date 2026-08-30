@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import typing
 
+import config
 from HoyoWrapper.auth_manager import AuthManager
 from HoyoWrapper.game_model import BaseGame, create_game, random_delay
 from HoyoWrapper.session import HoyoAPIError, HoyoSession, LoginError
@@ -33,13 +34,9 @@ __all__ = ["HoyoManager", "ActiveSession"]
 
 logger = logging.getLogger(__name__)
 
-# Juegos soportados por el wrapper
-_SUPPORTED_GAME_BIZ: frozenset[str] = frozenset({
-    "hk4e_global",  "hk4e_cn",
-    "hkrpg_global", "hkrpg_cn",
-    "nap_global",   "nap_cn",
-    "bh3_global",   "bh3_cn",
-})
+# Juegos soportados por el wrapper (definido una sola vez en config.py;
+# app.py y este archivo antes tenian cada uno su propia copia de este set).
+_SUPPORTED_GAME_BIZ = config.SUPPORTED_GAME_BIZ
 
 
 class ActiveSession:
@@ -87,7 +84,7 @@ class ActiveSession:
         results = []
         for i, game in enumerate(self.games):
             if i > 0:
-                await random_delay(1.0, 3.0)
+                await random_delay(*config.DELAY_BETWEEN_GAMES)
 
             try:
                 result = await game.claim_daily_reward()
@@ -141,8 +138,8 @@ class HoyoManager:
     def __init__(
         self,
         store: typing.Any,          # CookieStore o compatible
-        captcha_port: int = 5000,
-        lang: str = "en",
+        captcha_port: int = config.CAPTCHA_PORT_DEFAULT,
+        lang: str = config.CAPTCHA_LANG_OS,
     ) -> None:
         self._auth = AuthManager(store, captcha_port=captcha_port, lang=lang)
 

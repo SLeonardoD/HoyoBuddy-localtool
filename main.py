@@ -22,6 +22,7 @@ from datetime import datetime
 
 from loguru import logger
 
+import config
 from db import CookieStore, AccountStore
 from HoyoWrapper import HoyoManager
 from app import (
@@ -62,7 +63,7 @@ logger.add(
     diagnose=True,      # Variables locales en el traceback
 )
 
-DB_PATH = "./hoyo_auth.db"
+DB_PATH = config.DB_PATH
 
 # ---------------------------------------------------------------------------
 # Helpers de consola

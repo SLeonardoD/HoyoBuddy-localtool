@@ -27,6 +27,7 @@ import typing
 
 from loguru import logger
 
+import config
 from db.cookie_store import CookieStore
 from db.account_store import AccountStore
 from HoyoWrapper.session import HoyoSession, HoyoAPIError, LoginError
@@ -48,12 +49,9 @@ __all__ = [
     "RedeemResult",
 ]
 
-# URLs de canje de codigos por juego (para mostrar al usuario tras compra mimo)
-REDEEM_URLS: dict[str, str] = {
-    "hk4e_global":  "https://genshin.hoyoverse.com/en/gift",
-    "hkrpg_global": "https://hsr.hoyoverse.com/gift",
-    "nap_global":   "https://zenless.hoyoverse.com/redemption",
-}
+# URLs de canje de codigos por juego (para mostrar al usuario tras compra
+# mimo). Definidas una sola vez en config.py.
+REDEEM_URLS: dict[str, str] = config.REDEEM_WEBPAGE_URLS
 
 
 # ---------------------------------------------------------------------------
@@ -259,13 +257,10 @@ async def restore_session(
 
     # Construir ActiveSession con los juegos detectados
     from HoyoWrapper.game_model import create_game
-    _SUPPORTED = {
-        "hk4e_global", "hk4e_cn",
-        "hkrpg_global", "hkrpg_cn",
-        "nap_global", "nap_cn",
-        "bh3_global", "bh3_cn",
-    }
-    supported = [a for a in accounts if a.get("game_biz", "") in _SUPPORTED]
+    supported = [
+        a for a in accounts
+        if a.get("game_biz", "") in config.SUPPORTED_GAME_BIZ
+    ]
     return ActiveSession(session, supported)
 
 
@@ -297,7 +292,7 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
     for i, account in enumerate(accounts):
         # Delay entre cuentas (no antes de la primera)
         if i > 0:
-            await random_delay(2.0, 5.0)
+            await random_delay(*config.DELAY_BETWEEN_ACCOUNTS)
 
         alias = account["alias"]
         logger.info("=" * 60)
@@ -358,7 +353,7 @@ async def _process_account_games(
 
     for j, game in enumerate(active.games):
         if j > 0:
-            await random_delay(1.0, 3.0)
+            await random_delay(*config.DELAY_BETWEEN_GAMES)
 
         logger.info("  Juego: {}", game.GAME_NAME)
 
@@ -464,7 +459,7 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
         task_name = task.get("task_name") or task.get("name") or f"Tarea #{task_id}"
         task_type = task.get("task_type") or task.get("type")
 
-        await asyncio.sleep(round(random.uniform(0.8, 2.0), 2))
+        await asyncio.sleep(round(random.uniform(*config.DELAY_BETWEEN_MIMO_TASKS), 2))
 
         try:
             await game.finish_mimo_task(task_id)
@@ -493,7 +488,7 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
         task_id   = task.get("task_id") or task.get("id")
         task_name = task.get("task_name") or task.get("name") or f"Tarea #{task_id}"
 
-        await asyncio.sleep(round(random.uniform(0.8, 2.0), 2))
+        await asyncio.sleep(round(random.uniform(*config.DELAY_BETWEEN_MIMO_TASKS), 2))
 
         try:
             await game.claim_mimo_task_reward(task_id)
@@ -584,14 +579,13 @@ async def _process_mimo_buys(game) -> list[TaskResult]:
 
 # ---------------------------------------------------------------------------
 # Juegos que soportan canje de codigos (para el menu de seleccion)
-# Solo OS — CN no soportado via API
+# Solo OS — CN no soportado via API.
+# Definido en config.py, derivado automaticamente de CODE_URLS +
+# GAME_BIZ_MAP para que nunca quede desincronizado con los juegos que
+# realmente tienen endpoint de redeem configurado.
 # ---------------------------------------------------------------------------
 
-REDEEMABLE_GAMES: list[dict] = [
-    {"display": "Genshin Impact",    "game_biz": "hk4e_global"},
-    {"display": "Honkai: Star Rail", "game_biz": "hkrpg_global"},
-    {"display": "Zenless Zone Zero", "game_biz": "nap_global"},
-]
+REDEEMABLE_GAMES: list[dict] = config.REDEEMABLE_GAMES
 
 
 class RedeemResult(typing.TypedDict):
@@ -643,7 +637,7 @@ async def redeem_code_for_all(
     for i, account in enumerate(os_accounts):
         if i > 0:
             # Cooldown entre redeems — HoYoverse lo requiere
-            await random_delay(6.0, 10.0)
+            await random_delay(*config.DELAY_BETWEEN_REDEEMS)
 
         alias = account["alias"]
         logger.info("[REDEEM] Revisando cuenta: {}", alias)

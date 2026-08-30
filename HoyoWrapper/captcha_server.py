@@ -27,6 +27,8 @@ import aiohttp
 from aiohttp import web
 from loguru import logger
 
+import config
+
 __all__ = ["SessionMMT", "SessionMMTResult", "solve_geetest", "enter_code"]
 
 
@@ -130,8 +132,8 @@ _CAPTCHA_PAGE = """<!DOCTYPE html>
   </script>
 </html>"""
 
-_GT_V3_URL = "https://static.geetest.com/static/js/gt.0.5.0.js"
-_DEFAULT_API_SERVER = "api-na.geetest.com"
+_GT_V3_URL = config.GEETEST_JS_URL
+_DEFAULT_API_SERVER = config.GEETEST_API_SERVER_OS
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +237,7 @@ async def _launch_webapp(
                 # para simular tiempo de reaccion humano real (3-5s).
                 # Se usa random.uniform para obtener valores como 3.2s, 4.7s, etc.
                 import random
-                delay = round(random.uniform(3.0, 5.0), 2)
+                delay = round(random.uniform(*config.DELAY_CAPTCHA_HUMAN), 2)
                 logger.debug(
                     "[CAPTCHA] Aplicando delay humano de {}s antes de resolver...",
                     delay

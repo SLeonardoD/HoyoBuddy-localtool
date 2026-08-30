@@ -8,139 +8,56 @@ Logging exhaustivo via loguru para diagnostico en vivo:
   - Cada rama de flujo (captcha, email, cookies) loguea su estado.
   - Errores inesperados loguean el contexto completo.
 
+Los valores que cambian con el tiempo (URLs, claves RSA, salts, retcodes
+de captcha) viven en config.py — este archivo solo contiene logica.
+
 No contiene logica de DB. CookieStore se recibe por inyeccion.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import random
-import string
-import time
 import typing
 import uuid
 
 import aiohttp
 from loguru import logger
 
+import config
+from HoyoWrapper import ds_utils
 from HoyoWrapper.captcha_server import SessionMMT, SessionMMTResult, enter_code, solve_geetest
 from HoyoWrapper.session import HoyoAPIError, HoyoSession, LoginError
 
 __all__ = ["AuthManager"]
 
 # ---------------------------------------------------------------------------
-# Constantes
+# Alias locales cortos de config.py
 # ---------------------------------------------------------------------------
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+_USER_AGENT = config.USER_AGENT
 
-_WEB_LOGIN_URL = (
-    "https://sg-public-api.hoyolab.com/account/ma-passport/api/webLoginByPassword"
-)
-_CN_WEB_LOGIN_URL = (
-    "https://passport-api.miyoushe.com/account/ma-cn-passport/web/loginByPassword"
-)
-_SEND_VERIFICATION_URL = (
-    "https://sg-public-api.hoyoverse.com/account/ma-verifier/api"
-    "/createEmailCaptchaByActionTicket"
-)
-_VERIFY_EMAIL_URL = (
-    "https://sg-public-api.hoyoverse.com/account/ma-verifier/api"
-    "/verifyActionTicketPartly"
-)
-# Intercambio stoken_v2 + ltmid_v2 -> cookie_token_v2 (+ ltoken_v2).
-# Requerido porque redeem_code() en genshin.py exige cookie_token o
-# cookie_token_v2 (ver managers.requires_cookie_token); /webLoginByPassword
-# NO lo entrega, solo ltoken_v2/ltuid_v2/stoken.
-# Verificado contra genshin.py: client/routes.py -> COOKIE_V2_REFRESH_URL,
-# client/manager/cookie.py -> fetch_cookie_with_stoken_v2().
-_COOKIE_V2_REFRESH_URL = (
-    "https://sg-public-api.hoyoverse.com/account/ma-passport/token/getBySToken"
-)
-# Salt DS para este endpoint especifico (distinto del DS de check-in/mimo).
-# Verificado contra genshin.py: constants.py -> DS_SALT["app_login"].
-_DS_SALT_APP_LOGIN = "IZPgfb0dRPtBeLuFkdDznSZ6f4wWt6y2"
+_WEB_LOGIN_URL = config.WEB_LOGIN_URL
+_CN_WEB_LOGIN_URL = config.CN_WEB_LOGIN_URL
+_SEND_VERIFICATION_URL = config.SEND_VERIFICATION_URL
+_VERIFY_EMAIL_URL = config.VERIFY_EMAIL_URL
+_COOKIE_V2_REFRESH_URL = config.COOKIE_V2_REFRESH_URL
+_DS_SALT_APP_LOGIN = config.DS_SALT_APP_LOGIN
 
+_RSA_KEY_1 = config.RSA_KEY_1
+_RSA_KEY_2 = config.RSA_KEY_2
 
-def _generate_app_login_ds() -> str:
-    """
-    Genera el header 'ds' (dynamic secret) para el endpoint getBySToken.
-
-    Formato "t,r,md5(salt=...&t=...&r=...)" sin body/query — replica
-    genshin.py: utility/ds.py -> generate_dynamic_secret(). NO confundir
-    con generate_app_login_ds() de genshin.py (esa incluye el body en el
-    hash y es para OTRO endpoint de login por app, no para este).
-    """
-    t = int(time.time())
-    r = "".join(random.choices(string.ascii_letters, k=6))
-    h = hashlib.md5(f"salt={_DS_SALT_APP_LOGIN}&t={t}&r={r}".encode()).hexdigest()
-    return f"{t},{r},{h}"
-
-_RSA_KEY_1 = (
-    "-----BEGIN PUBLIC KEY-----\n"
-    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4PMS2JVMwBsOIrYWRluY\n"
-    "wEiFZL7Aphtm9z5Eu/anzJ09nB00uhW+ScrDWFECPwpQto/GlOJYCUwVM/raQpAj\n"
-    "/xvcjK5tNVzzK94mhk+j9RiQ+aWHaTXmOgurhxSp3YbwlRDvOgcq5yPiTz0+kSeK\n"
-    "ZJcGeJ95bvJ+hJ/UMP0Zx2qB5PElZmiKvfiNqVUk8A8oxLJdBB5eCpqWV6CUqDKQ\n"
-    "KSQP4sM0mZvQ1Sr4UcACVcYgYnCbTZMWhJTWkrNXqI8TMomekgny3y+d6NX/cFa6\n"
-    "6jozFIF4HCX5aW8bp8C8vq2tFvFbleQ/Q3CU56EWWKMrOcpmFtRmC18s9biZBVR/\n"
-    "8QIDAQAB\n"
-    "-----END PUBLIC KEY-----"
-)
-
-_RSA_KEY_2 = (
-    "-----BEGIN PUBLIC KEY-----\n"
-    "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDDvekdPMHN3AYhm/vktJT+YJr7\n"
-    "cI5DcsNKqdsx5DZX0gDuWFuIjzdwButrIYPNmRJ1G8ybDIF7oDW2eEpm5sMbL9zs\n"
-    "9ExXCdvqrn51qELbqj0XxtMTIpaCHFSI50PfPpTFV9Xt/hmyVwokoOXFlAEgCn+Q\n"
-    "CgGs52bFoYMtyi+xEQIDAQAB\n"
-    "-----END PUBLIC KEY-----"
-)
-
-_WEB_LOGIN_HEADERS: dict[str, str] = {
-    "x-rpc-app_id":      "c9oqaq3s3gu8",
-    "x-rpc-client_type": "4",
-    "x-rpc-app_version": "2.55.0",
-    "Origin":            "https://account.hoyolab.com",
-    "Referer":           "https://account.hoyolab.com/",
-    "Content-Type":      "application/json",
-    "User-Agent":        _USER_AGENT,
-}
-
-_CN_LOGIN_HEADERS: dict[str, str] = {
-    "x-rpc-app_id":      "bll8iq97cem8",
-    "x-rpc-client_type": "4",
-    "x-rpc-app_version": "2.55.0",
-    "Origin":            "https://user.mihoyo.com",
-    "Referer":           "https://user.mihoyo.com/",
-    "Content-Type":      "application/json",
-    "User-Agent":        _USER_AGENT,
-}
-
-_EMAIL_SEND_HEADERS: dict[str, str] = {
-    "x-rpc-app_id":      "c9oqaq3s3gu8",
-    "x-rpc-client_type": "4",
-    "x-rpc-app_version": "2.55.0",
-    "Content-Type":      "application/json",
-    "User-Agent":        _USER_AGENT,
-}
-
+_WEB_LOGIN_HEADERS: dict[str, str] = {**config.WEB_LOGIN_HEADERS, "User-Agent": _USER_AGENT}
+_CN_LOGIN_HEADERS: dict[str, str] = {**config.CN_LOGIN_HEADERS, "User-Agent": _USER_AGENT}
+_EMAIL_SEND_HEADERS: dict[str, str] = {**config.EMAIL_SEND_HEADERS, "User-Agent": _USER_AGENT}
 _EMAIL_VERIFY_HEADERS: dict[str, str] = {**_EMAIL_SEND_HEADERS}
 
-# Retcodes conocidos de captcha — se expanden aqui si HoYoverse añade nuevos
-_CAPTCHA_RETCODES_OS: frozenset[int] = frozenset({-3101, -3200, -3206})
-_CAPTCHA_RETCODES_CN: frozenset[int] = frozenset({-3102, -3200, -3206})
+_CAPTCHA_RETCODES_OS = config.CAPTCHA_RETCODES_OS
+_CAPTCHA_RETCODES_CN = config.CAPTCHA_RETCODES_CN
 
 # Mensajes de errores de credenciales — usados para decidir si hacer fallback a CN
 _MESSAGES_FOR_FALLBACK: dict[int, str] = {
-    -3001: "Cuenta o contrasena incorrectos.",
-    -3002: "La cuenta no existe.",
-    -3003: "Contrasena incorrecta.",
+    code: config.LOGIN_ERROR_MESSAGES[code]
+    for code in config.CREDENTIAL_ERROR_RETCODES
 }
 
 
@@ -231,8 +148,8 @@ class AuthManager:
     def __init__(
         self,
         store: _CookieStoreProtocol,
-        captcha_port: int = 5000,
-        lang: str = "en",
+        captcha_port: int = config.CAPTCHA_PORT_DEFAULT,
+        lang: str = config.CAPTCHA_LANG_OS,
     ) -> None:
         self._store = store
         self._captcha_port = captcha_port
@@ -490,7 +407,7 @@ class AuthManager:
 
         headers = {
             "User-Agent":    _USER_AGENT,
-            "ds":            _generate_app_login_ds(),
+            "ds":            ds_utils.generate_dynamic_secret(_DS_SALT_APP_LOGIN),
             "x-rpc-app_id":  "c9oqaq3s3gu8",
         }
         body = {"dst_token_types": [2, 4]}
@@ -727,7 +644,7 @@ class AuthManager:
                 session_id=captcha["session_id"],
             ),
             lang=self._lang,
-            api_server="api-na.geetest.com",
+            api_server=config.GEETEST_API_SERVER_OS,
             port=self._captcha_port,
         )
         logger.debug("[AUTH] Captcha OS resuelto: {}", mmt_result)
@@ -760,8 +677,8 @@ class AuthManager:
                 success=captcha["success"],
                 session_id=captcha["session_id"],
             ),
-            lang="zh-cn",
-            api_server="api.geetest.com",
+            lang=config.CAPTCHA_LANG_CN,
+            api_server=config.GEETEST_API_SERVER_CN,
             port=self._captcha_port,
         )
         logger.debug("[AUTH] Captcha CN resuelto: {}", mmt_result)
@@ -991,16 +908,6 @@ def _build_aigis_header(mmt_result: SessionMMTResult, mmt_type: int = 1) -> str:
 
 def _raise_login_error(retcode: int, message: str) -> typing.NoReturn:
     """Convierte retcodes de HoYoverse en LoginError con mensajes descriptivos."""
-    _MESSAGES: dict[int, str] = {
-        -3001: "Cuenta o contrasena incorrectos.",
-        -3002: "La cuenta no existe.",
-        -3003: "Contrasena incorrecta.",
-        -3004: "La cuenta esta bloqueada.",
-        -3101: "Captcha requerido (OS) pero no fue resuelto.",
-        -3102: "Captcha requerido (CN) pero no fue resuelto.",
-        -3104: "Falta el header x-rpc-device_id en la peticion.",
-        -3200: "Captcha requerido pero no fue resuelto.",
-        -3206: "Captcha requerido pero no fue resuelto.",
-        -3239: "Verificacion de email requerida pero no completada.",
-    }
-    raise LoginError(_MESSAGES.get(retcode, f"Error de login [{retcode}]: {message}"))
+    raise LoginError(
+        config.LOGIN_ERROR_MESSAGES.get(retcode, f"Error de login [{retcode}]: {message}")
+    )

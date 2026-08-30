@@ -5,7 +5,10 @@ Módulo de Zenless Zone Zero. Solo constantes; toda la lógica está en BaseGame
 
 Particularidades respecto a Genshin:
   - Mimo: rutas estándar /<endpoint>, GET para claim_mimo_task_reward.
-  - Redeem: POST con webExchangeCdkeyRisk.
+  - Redeem: POST con webExchangeCdkey (SIN "Risk" — ese sufijo es
+    exclusivo de StarRail; ZZZ usa el mismo endpoint que Genshin,
+    solo que con metodo POST en vez de GET).
+    Verificado contra genshin.py: post_request_games = {ZZZ, STARRAIL}.
   - x-rpc-signgame: "zzz"
   - Check-in URL propia: event/luna/zzz/os (distinta de HSR y Honkai).
 """

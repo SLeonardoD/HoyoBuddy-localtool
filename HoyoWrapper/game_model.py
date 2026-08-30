@@ -3,22 +3,15 @@ HoyoWrapper/game_model.py
 -------------------------
 Clase base para todos los modulos de juego.
 
-Correcciones respecto a la version anterior (basadas en genshin.py actual):
-  - URL base mimo: miyoubi -> e2023mimotravel
-  - Prefijo Genshin mimo: /qiuqiu/ -> /nata/
-  - URL check-in hk4e_cn corregida
-  - URL check-in nap_global corregida (sg-act-nap-api)
-  - URL check-in bh3_global corregida (event/mani)
-  - act_id hk4e_cn, nap_cn, bh3_cn corregidos
-  - redeem ZZZ: POST -> GET (igual que Genshin)
-  - finish_mimo_task() implementado para tareas completables via web
-  - Logging exhaustivo en todas las operaciones
+Los valores que HoYoverse cambia regularmente (act_id, URLs, salts, etc.)
+viven en config.py — este archivo solo contiene logica. Ver config.py
+para el detalle de cada valor y su fuente de verificacion.
 
 Medidas anti-deteccion mantenidas:
   - device_id persistente de HoyoSession.
   - x-rpc-device_model en headers CN.
   - Retry con backoff exponencial + jitter (tenacity).
-  - Delays aleatorios entre operaciones multiples.
+  - Delays aleatorios entre operaciones multiples (ver config.DELAY_*).
 
 Tipos de tareas mimo completables via finish_mimo_task:
   VISIT(2), COMMENT(3), VIEW_TOPIC(4), TRAILER(10) y similares.
@@ -39,6 +32,8 @@ from loguru import logger
 if typing.TYPE_CHECKING:
     from HoyoWrapper.session import HoyoSession
 
+import config
+from HoyoWrapper import ds_utils
 from HoyoWrapper.session import HoyoAPIError
 
 __all__ = [
@@ -52,130 +47,42 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Mapeos de identificadores de juego
+# Re-exports desde config.py (mantiene compatibilidad con codigo/tests
+# existentes que importan estos nombres directamente de game_model).
 # ---------------------------------------------------------------------------
 
-GAME_BIZ_MAP: dict[str, str] = {
-    "hk4e_global":  "Genshin Impact",
-    "hk4e_cn":      "Genshin Impact (CN)",
-    "hkrpg_global": "Honkai: Star Rail",
-    "hkrpg_cn":     "Honkai: Star Rail (CN)",
-    "nap_global":   "Zenless Zone Zero",
-    "nap_cn":       "Zenless Zone Zero (CN)",
-    "bh3_global":   "Honkai Impact 3rd",
-    "bh3_cn":       "Honkai Impact 3rd (CN)",
-    "nxx_global":   "Tears of Themis",
-    "nxx_cn":       "Tears of Themis (CN)",
-}
-
-GAME_ID_MAP: dict[str, int] = {
-    "hk4e_global":  2,
-    "hk4e_cn":      2,
-    "hkrpg_global": 6,
-    "hkrpg_cn":     6,
-    "nap_global":   8,
-    "nap_cn":       8,
-}
-
-CURRENCY_ITEM_KEYWORDS: dict[str, list[str]] = {
-    "hk4e_global":  ["genesis crystal", "genesis crystals"],
-    "hk4e_cn":      ["创世结晶"],
-    "hkrpg_global": ["oneiric shard", "oneiric shards"],
-    "hkrpg_cn":     ["星琼"],
-    "nap_global":   ["monochrome", "polychrome"],
-    "nap_cn":       ["菲林", "加密母带"],
-    "bh3_global":   ["ether fuel"],
-    "bh3_cn":       ["以太燃料"],
-}
-
-# Tipos de tareas mimo que se pueden completar via finish_mimo_task()
-# Basado en MimoTaskType de genshin.py/models/hoyolab/mimo.py
-# NO incluir: GI_LOGIN(5), GI_GAME(6), HSR_GAME(8),
-#             ZZZ_DAILY_LOGIN(12), ZZZ_CONSECUTIVE_LOGIN(13), ZZZ_GAME(16)
-# Estos requieren accion real dentro del juego.
-MIMO_FINISHABLE_TASK_TYPES: frozenset[int] = frozenset({
-    1,   # FINISHABLE — tutoriales y similares
-    2,   # VISIT — visitar grupo de interes
-    3,   # COMMENT — participar en interacciones
-    4,   # VIEW_TOPIC — ver un tema
-    10,  # TRAILER — ver trailer
-})
+GAME_BIZ_MAP = config.GAME_BIZ_MAP
+GAME_ID_MAP = config.GAME_ID_MAP
+CURRENCY_ITEM_KEYWORDS = config.CURRENCY_ITEM_KEYWORDS
+MIMO_FINISHABLE_TASK_TYPES = config.MIMO_FINISHABLE_TASK_TYPES
 
 # ---------------------------------------------------------------------------
-# URLs base de los endpoints
+# Alias locales cortos de config.py (solo para no tener que escribir
+# "config." delante de cada uso dentro de este archivo).
 # ---------------------------------------------------------------------------
 
-# Check-in diario. Fuente: genshin.py/routes.py (REWARD_URL).
-# Correcciones: hk4e_cn, nap_global, bh3_global actualizados.
-_REWARD_URLS: dict[str, str] = {
-    "hk4e_global":  "https://sg-hk4e-api.hoyolab.com/event/sol",
-    "hk4e_cn":      "https://api-takumi.mihoyo.com/event/luna/",
-    "hkrpg_global": "https://sg-public-api.hoyolab.com/event/luna/os",
-    "hkrpg_cn":     "https://api-takumi.mihoyo.com/event/luna/",
-    "nap_global":   "https://sg-act-nap-api.hoyolab.com/event/luna/zzz/os",
-    "nap_cn":       "https://api-takumi.mihoyo.com/event/luna/zzz",
-    "bh3_global":   "https://sg-public-api.hoyolab.com/event/mani",
-    "bh3_cn":       "https://api-takumi.mihoyo.com/event/luna/",
-}
-
-# act_id requerido en check-in. Fuente: genshin.py/routes.py.
-# Correcciones: hk4e_cn, nap_cn, bh3_cn actualizados.
-_ACT_IDS: dict[str, str] = {
-    "hk4e_global":  "e202102251931481",
-    "hk4e_cn":      "e202311201442471",
-    "hkrpg_global": "e202303301540311",
-    "hkrpg_cn":     "e202304121516551",
-    "nap_global":   "e202406031448091",
-    "nap_cn":       "e202406242138391",
-    "bh3_global":   "e202110291205111",
-    "bh3_cn":       "e202306201626331",
-}
-
-# x-rpc-signgame por juego. Fuente: genshin.py/daily.py.
-_SIGNGAME: dict[str, str] = {
-    "hk4e_global":  "hk4e",
-    "hk4e_cn":      "hk4e",
-    "hkrpg_global": "hkrpg",
-    "hkrpg_cn":     "hkrpg",
-    "nap_global":   "zzz",
-    "nap_cn":       "zzz",
-    "bh3_global":   "bh3",
-    "bh3_cn":       "bh3",
-}
-
-# URLs de canje de codigos. Fuente: genshin.py/routes.py (CODE_URL).
-# Correccion: ZZZ usa GET (igual que Genshin), no POST.
-_CODE_URLS: dict[str, str] = {
-    "hk4e_global":  "https://sg-hk4e-api.hoyoverse.com/common/apicdkey/api/webExchangeCdkey",
-    "hkrpg_global": "https://sg-hkrpg-api.hoyoverse.com/common/apicdkey/api/webExchangeCdkeyRisk",
-    "nap_global":   "https://public-operation-nap.hoyoverse.com/common/apicdkey/api/webExchangeCdkey",
-}
-
-# Solo StarRail usa POST para redeem. Genshin y ZZZ usan GET.
-# Fuente: genshin.py hoyolab.py redeem_code():
-#   method="POST" if game is types.Game.STARRAIL else "GET"
-_CODE_POST_GAMES: frozenset[str] = frozenset({"hkrpg_global"})
-
-_CODE_ORIGINS: dict[str, str] = {
-    "hk4e_global":  "https://genshin.hoyoverse.com",
-    "hkrpg_global": "https://hsr.hoyoverse.com",
-    "nap_global":   "https://zenless.hoyoverse.com",
-}
-
-# URL base mimo. Fuente: genshin.py/routes.py (MIMO_URL).
-# Correccion: miyoubi -> e2023mimotravel
-_MIMO_BASE_URL = "https://sg-public-api.hoyolab.com/event/e2023mimotravel"
-
-_DS_SALT_CN_SIGNIN = "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs"
+_REWARD_URLS = config.REWARD_URLS
+_ACT_IDS = config.ACT_IDS
+_SIGNGAME = config.SIGNGAME
+_CODE_URLS = config.CODE_URLS
+_CODE_POST_GAMES = config.CODE_POST_GAMES
+_CODE_ORIGINS = config.CODE_ORIGINS
+_MIMO_BASE_URL = config.MIMO_BASE_URL
+_DS_SALT_CN_SIGNIN = config.DS_SALT_CN_SIGNIN
 
 # ---------------------------------------------------------------------------
 # Utilidades anti-deteccion
 # ---------------------------------------------------------------------------
 
-async def random_delay(min_s: float = 1.0, max_s: float = 3.0) -> None:
+async def random_delay(
+    min_s: float = config.DELAY_BETWEEN_GAMES[0],
+    max_s: float = config.DELAY_BETWEEN_GAMES[1],
+) -> None:
     """
     Espera aleatoria con decimales entre operaciones para evitar patrones
     de timing robotico. Valores tipicos: 1.3s, 2.7s, etc.
+    Default tomado de config.DELAY_BETWEEN_GAMES; los llamadores pasan
+    otros rangos de config.DELAY_* segun el contexto (cuentas, redeems, etc.).
     """
     delay = round(random.uniform(min_s, max_s), 2)
     logger.debug("[GAME] Anti-deteccion: delay de {}s.", delay)
@@ -197,8 +104,12 @@ def _is_rate_limit(exc: BaseException) -> bool:
 
 _RETRY_KWARGS = dict(
     retry=tenacity.retry_if_exception(_is_rate_limit),
-    wait=tenacity.wait_random_exponential(multiplier=2, min=5, max=60),
-    stop=tenacity.stop_after_attempt(4),
+    wait=tenacity.wait_random_exponential(
+        multiplier=config.RETRY_WAIT_MULTIPLIER,
+        min=config.RETRY_WAIT_MIN,
+        max=config.RETRY_WAIT_MAX,
+    ),
+    stop=tenacity.stop_after_attempt(config.RETRY_STOP_ATTEMPTS),
     before_sleep=tenacity.before_sleep_log(logger, "WARNING"),
     reraise=True,
 )
@@ -308,19 +219,24 @@ class BaseGame:
             headers["Referer"] = "https://act.hoyolab.com/"
         else:
             headers.update({
-                "x-rpc-app_version":  "2.70.1",
-                "x-rpc-client_type":  "5",
+                "x-rpc-app_version":  config.CN_CHECKIN_APP_VERSION,
+                "x-rpc-client_type":  config.CN_CHECKIN_CLIENT_TYPE,
                 "x-rpc-device_id":    self.session.device_id,
-                "x-rpc-sys_version":  "12",
-                "x-rpc-platform":     "android",
-                "x-rpc-channel":      "miyousheluodi",
+                "x-rpc-sys_version":  config.CN_CHECKIN_SYS_VERSION,
+                "x-rpc-platform":     config.CN_CHECKIN_PLATFORM,
+                "x-rpc-channel":      config.CN_CHECKIN_CHANNEL,
                 "x-rpc-device_model": str(self.session.account_id or ""),
+                # BUG FIX: la version anterior intentaba
+                # "from _ds_utility import generate_dynamic_secret", un
+                # modulo que NO existe en el proyecto — el import siempre
+                # fallaba, el ImportError se tragaba silenciosamente, y
+                # el check-in CN se enviaba SIN header 'ds'. Verificado
+                # contra genshin.py client/components/daily.py: el check-in
+                # CN requiere ds_utility.generate_dynamic_secret(
+                # DS_SALT["cn_signin"]) — la variante SIMPLE (sin body/query
+                # en el hash), no generate_cn_dynamic_secret().
+                "ds": ds_utils.generate_dynamic_secret(_DS_SALT_CN_SIGNIN),
             })
-            try:
-                from _ds_utility import generate_dynamic_secret  # type: ignore[import]
-                headers["ds"] = generate_dynamic_secret(_DS_SALT_CN_SIGNIN)
-            except ImportError:
-                pass
 
         return headers
 
@@ -700,7 +616,7 @@ class BaseGame:
                 continue
 
             if not first:
-                await random_delay(1.5, 4.0)
+                await random_delay(*config.DELAY_BETWEEN_MIMO_PURCHASES)
             first = False
 
             url = self._mimo_url("exchange")
@@ -742,8 +658,9 @@ class BaseGame:
     async def redeem_code(self, code: str, *, lang: str = "en") -> None:
         """
         Canjea un codigo regalo.
-        StarRail: POST. Genshin y ZZZ: GET.
+        StarRail y ZZZ: POST. Genshin: GET.
         Fuente: genshin.py/hoyolab.py/redeem_code()
+          post_request_games = {types.Game.ZZZ, types.Game.STARRAIL}
         """
         base_url = _CODE_URLS.get(self.game_biz)
         if not base_url:

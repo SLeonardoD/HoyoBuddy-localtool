@@ -20,23 +20,17 @@ import uuid
 
 import aiohttp
 
+import config
+
 __all__ = ["HoyoSession", "HoyoAPIError", "LoginError"]
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+_USER_AGENT = config.USER_AGENT
 
 # URLs para obtener cuentas de juego vinculadas
-_GAME_ACCOUNTS_OS_URL = (
-    "https://api-os-takumi.mihoyo.com/binding/api/getUserGameRolesByCookie"
-)
-_GAME_ACCOUNTS_CN_URL = (
-    "https://api-takumi.mihoyo.com/binding/api/getUserGameRolesByCookie"
-)
+_GAME_ACCOUNTS_OS_URL = config.GAME_ACCOUNTS_OS_URL
+_GAME_ACCOUNTS_CN_URL = config.GAME_ACCOUNTS_CN_URL
 
 
 # ---------------------------------------------------------------------------
