@@ -1,20 +1,14 @@
 """
 db/
 ---
-Paquete de persistencia local.
+Capa de persistencia de HoYoWrapper.
 
-Exporta:
-  CookieStore    Almacen de cookies de sesion por usuario y region.
-  AccountStore   Almacen de cuentas registradas con alias legible.
-
-Uso:
-    from db import CookieStore, AccountStore
-
-    cookie_store  = CookieStore("./hoyo_auth.db")
-    account_store = AccountStore("./hoyo_auth.db")
+AccountStore    Cuentas registradas: cookies de sesion + alias, en una
+                sola tabla (ver store.py para el detalle del diseño).
+GiftCodeStore   Codigos de regalo pendientes de canjear + historial de
+                que cuenta ya canjeo (o no pudo canjear) cada codigo.
 """
 
-from db.cookie_store import CookieStore
-from db.account_store import AccountStore
+from db.store import AccountStore, GiftCodeStore
 
-__all__ = ["CookieStore", "AccountStore"]
+__all__ = ["AccountStore", "GiftCodeStore"]

@@ -8,15 +8,18 @@ testeable de forma independiente. main.py solo orquesta el menu y llama
 a las funciones de este modulo.
 
 Responsabilidades:
-  - Registro y eliminacion de cuentas.
-  - Restaurar sesiones guardadas por account_hash (sin necesitar el email).
+  - Registro, relogin y eliminacion de cuentas.
+  - Restaurar sesiones guardadas.
   - Ejecutar las tareas diarias (check-in, mimo, compra) por cuenta y juego.
+  - Sistema de codigos de regalo: agregar codigos a la DB y canjear
+    automaticamente los pendientes en todas las cuentas que apliquen,
+    ademas del canje manual puntual.
   - Producir resultados estructurados que main.py imprime.
 
 Dependencias inyectadas (no se crean aqui):
-  - CookieStore   almacen de cookies
-  - AccountStore  almacen de aliases
-  - HoyoManager   wrapper de autenticacion y juegos
+  - AccountStore   cuentas (cookies + alias unificados)
+  - GiftCodeStore  codigos de regalo + tracking de canjes
+  - HoyoManager    wrapper de autenticacion y juegos
 """
 
 from __future__ import annotations
@@ -24,12 +27,12 @@ from __future__ import annotations
 import asyncio
 import random
 import typing
+from datetime import datetime, timezone
 
 from loguru import logger
 
 import config
-from db.cookie_store import CookieStore
-from db.account_store import AccountStore
+from db.store import AccountStore, GiftCodeStore
 from HoyoWrapper.session import HoyoSession, HoyoAPIError, LoginError
 from HoyoWrapper.session_manager import HoyoManager, ActiveSession
 from HoyoWrapper.game_model import random_delay
@@ -37,11 +40,14 @@ from HoyoWrapper.game_model import random_delay
 __all__ = [
     "AppContext",
     "add_account",
+    "relogin_account",
     "delete_account",
     "list_accounts",
     "restore_session",
     "run_daily_tasks",
     "redeem_code_for_all",
+    "add_gift_code",
+    "redeem_pending_codes",
     "REDEEMABLE_GAMES",
     "TaskResult",
     "AccountResult",
@@ -63,8 +69,8 @@ class AppContext(typing.NamedTuple):
     Dependencias de la aplicacion agrupadas para inyeccion limpia.
     Se crea una vez en main.py y se pasa a todas las funciones.
     """
-    cookie_store:  CookieStore
     account_store: AccountStore
+    code_store:    GiftCodeStore
     manager:       HoyoManager
 
 
@@ -111,8 +117,10 @@ async def add_account(
 
     Flujo:
       1. Verifica que el alias no exista ya.
-      2. Hace login con el wrapper (obtiene cookies + account_hash).
-      3. Guarda cookies en CookieStore y alias en AccountStore.
+      2. Hace login con el wrapper (AuthManager persiste las cookies
+         en AccountStore por su cuenta, indexado por email+region, sin
+         necesidad de conocer el alias).
+      3. Asigna el alias a esa fila con set_alias().
 
     Devuelve dict con:
         success      bool
@@ -153,15 +161,10 @@ async def add_account(
             "games": [],
         }
 
-    # Calcular account_hash igual que lo hace CookieStore
-    from db.cookie_store import _hash_email
-    account_hash = _hash_email(email)
-
-    # Guardar alias en AccountStore
+    # Asignar el alias a la fila que AuthManager acaba de crear/actualizar
     try:
-        ctx.account_store.add(alias, account_hash, session.region)
+        ctx.account_store.set_alias(email, session.region, alias)
     except ValueError as e:
-        # La cuenta puede ya estar registrada con otro alias
         return {
             "success": False,
             "message": str(e),
@@ -185,13 +188,66 @@ async def add_account(
     }
 
 
+async def relogin_account(ctx: AppContext, alias: str, password: str) -> dict:
+    """
+    Reingresa la contrasena de una cuenta ya registrada cuyas cookies
+    expiraron, sin pedir el email de nuevo (ya lo tenemos guardado en
+    texto plano — para eso se dejo de hashear).
+
+    Flujo:
+      1. Busca la cuenta por alias para obtener su email/region.
+      2. Llama a manager.login(email, password, region=region) — esto
+         hace un login por credenciales normal (con captcha si hace
+         falta) y AuthManager persiste las cookies nuevas en la MISMA
+         fila (el alias no se toca, set() nunca lo modifica).
+
+    Devuelve el mismo shape que add_account().
+    """
+    account = ctx.account_store.get_by_alias(alias)
+    if account is None:
+        return {
+            "success": False,
+            "message": f"No existe ninguna cuenta con el alias '{alias}'.",
+            "alias": alias, "region": "", "games": [],
+        }
+
+    email  = account["email"]
+    region = account["region"]
+
+    try:
+        session = await ctx.manager.login(email, password, region=region)
+    except LoginError as e:
+        logger.exception("Error de relogin para '{}'.", alias)
+        return {
+            "success": False,
+            "message": f"Error de login: {e}",
+            "alias": alias, "region": region, "games": [],
+        }
+    except Exception as e:
+        logger.exception("Error inesperado en relogin para '{}'.", alias)
+        return {
+            "success": False,
+            "message": f"Error inesperado: {e}",
+            "alias": alias, "region": region, "games": [],
+        }
+
+    game_names = [g.GAME_NAME for g in session.games]
+    logger.info("Cuenta '{}' reautenticada correctamente.", alias)
+    return {
+        "success": True,
+        "message": f"Cuenta '{alias}' reautenticada correctamente.",
+        "alias": alias, "region": session.region, "games": game_names,
+    }
+
+
 def delete_account(ctx: AppContext, alias: str) -> dict:
     """
-    Elimina una cuenta por alias.
+    Elimina una cuenta por alias (soft-delete).
 
-    Elimina el alias de AccountStore pero NO las cookies de CookieStore
-    — si el usuario vuelve a registrar la misma cuenta, las cookies siguen
-    validas y se reutilizaran sin necesidad de captcha.
+    Le quita el alias a la fila en AccountStore pero preserva las
+    cookies — si el usuario vuelve a registrar la misma cuenta, se
+    reutilizan sin necesidad de login+captcha de nuevo. Ver
+    AccountStore.delete_by_alias() para el detalle.
 
     Devuelve dict con success y message.
     """
@@ -224,25 +280,26 @@ async def restore_session(
     """
     Restaura una sesion guardada a partir de un registro de AccountStore.
 
-    No necesita email — usa account_hash para recuperar las cookies de
-    CookieStore directamente. Si las cookies expiraron devuelve None.
+    Ya no hace falta una segunda consulta a la DB: account_store.list_all()
+    (o get_by_alias()) ya trae cookies+device_id en el mismo dict, porque
+    ahora es una sola tabla. Si las cookies expiraron devuelve None.
 
     Parametros:
-        account     Dict de AccountStore.list_all(): {alias, account_hash, region}
+        account     Dict de AccountStore.list_all():
+                    {alias, email, region, cookies, device_id, ...}
     """
-    account_hash = account["account_hash"]
-    region       = account["region"]
+    region  = account["region"]
+    cookies = account["cookies"]
 
-    cookies, device_id = ctx.cookie_store.get_by_hash(account_hash, region)
     if not cookies:
         logger.warning(
-            "No se encontraron cookies para la cuenta '{}'. "
+            "No hay cookies guardadas para la cuenta '{}'. "
             "Vuelve a registrarla con 'Agregar cuenta'.",
             account["alias"]
         )
         return None
 
-    session = HoyoSession(cookies, region, device_id)
+    session = HoyoSession(cookies, region, account["device_id"])
 
     # Validar que las cookies siguen siendo validas
     try:
@@ -250,13 +307,12 @@ async def restore_session(
     except (HoyoAPIError, Exception):
         logger.warning(
             "Las cookies de '{}' han expirado. "
-            "Vuelve a registrarla con 'Agregar cuenta'.",
+            "Usa 'Reingresar contrasena' para renovarlas sin perder el alias.",
             account["alias"]
         )
         return None
 
     # Construir ActiveSession con los juegos detectados
-    from HoyoWrapper.game_model import create_game
     supported = [
         a for a in accounts
         if a.get("game_biz", "") in config.SUPPORTED_GAME_BIZ
@@ -308,7 +364,7 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
                 "success": False,
                 "message": (
                     "Sesion expirada o no encontrada. "
-                    "Vuelve a registrar la cuenta con 'Agregar cuenta'."
+                    "Usa 'Reingresar contrasena' para renovarla."
                 ),
                 "tasks": [],
             })
@@ -597,6 +653,34 @@ class RedeemResult(typing.TypedDict):
     message:   str
 
 
+def _classify_redeem_error(e: HoyoAPIError) -> tuple[str, str]:
+    """
+    Clasifica un HoyoAPIError de redeem_code() en (scope, label).
+
+    scope:
+        'global'    El codigo murio para TODAS las cuentas.
+        'account'   Resultado definitivo pero solo para esta cuenta.
+        'transient' Temporal — no guardar nada, reintentar despues.
+
+    label (solo relevante si scope == 'account'):
+        'claimed'    Ya lo habia reclamado esta cuenta.
+        'ineligible' No aplica a esta cuenta (region/nivel).
+
+    Ver config.REDEEM_*_RETCODES para las listas y su fuente
+    (genshin.py errors.py).
+    """
+    if e.retcode in config.REDEEM_GLOBAL_DEAD_RETCODES:
+        return "global", ""
+    if e.retcode in config.REDEEM_ACCOUNT_CLAIMED_RETCODES:
+        return "account", "claimed"
+    if e.retcode in config.REDEEM_ACCOUNT_INELIGIBLE_RETCODES:
+        return "account", "ineligible"
+    # Cooldown, "aun no activado", o cualquier retcode que no reconocemos
+    # todavia: mejor reintentar de mas que marcar como muerto algo que
+    # en realidad seguia valido.
+    return "transient", ""
+
+
 async def redeem_code_for_all(
     ctx: AppContext,
     game_biz: str,
@@ -605,7 +689,17 @@ async def redeem_code_for_all(
     lang: str = "en",
 ) -> list[RedeemResult]:
     """
-    Canjea un codigo de regalo en todas las cuentas que tengan el juego indicado.
+    Canje MANUAL de un codigo puntual en todas las cuentas que tengan
+    el juego indicado (no requiere haberlo agregado antes a la DB).
+
+    Ademas de canjearlo, esta funcion:
+      - Registra el codigo en GiftCodeStore (si no existia) para que
+        CUALQUIER otra cuenta lo aproveche automaticamente la proxima
+        vez que se corra "Canjear codigos pendientes" — asi el canje
+        manual tambien alimenta el sistema automatico.
+      - Clasifica cada resultado con _classify_redeem_error() y lo
+        persiste igual que lo haria el canje automatico, para que no
+        se reintente de mas ni de menos la proxima vez.
 
     Flujo por cuenta:
       1. Restaurar sesion desde cookies guardadas.
@@ -631,6 +725,8 @@ async def redeem_code_for_all(
         )
         return []
 
+    code_id = ctx.code_store.get_or_create_code_id(game_biz, code)
+
     results: list[RedeemResult] = []
     found_any = False
 
@@ -646,7 +742,7 @@ async def redeem_code_for_all(
         if active is None:
             logger.warning(
                 "[REDEEM] Sesion expirada para '{}'. "
-                "Vuelve a registrar la cuenta con 'Agregar cuenta'.", alias
+                "Usa 'Reingresar contrasena' para renovarla.", alias
             )
             continue
 
@@ -668,6 +764,9 @@ async def redeem_code_for_all(
             logger.success(
                 "[REDEEM] Canjeado en '{}' ({} uid={}).",
                 alias, target_game.GAME_NAME, target_game.uid
+            )
+            ctx.code_store.record_redemption(
+                code_id, alias, "success", "Canjeado correctamente."
             )
             results.append({
                 "alias":     alias,
@@ -693,17 +792,149 @@ async def redeem_code_for_all(
                 alias, target_game.GAME_NAME, target_game.uid,
                 e.retcode, e.message
             )
+            scope, label = _classify_redeem_error(e)
+            msg = f"[{e.retcode}] {e.message}"
+            if scope == "global":
+                ctx.code_store.mark_dead(code_id, msg)
+                logger.warning(
+                    "[REDEEM] Codigo '{}' marcado como muerto globalmente: {}",
+                    code, msg
+                )
+            elif scope == "account":
+                ctx.code_store.record_redemption(code_id, alias, label, msg)
+            # scope == "transient": no se guarda nada, se reintenta despues
             results.append({
                 "alias":     alias,
                 "game_name": target_game.GAME_NAME,
                 "uid":       target_game.uid,
                 "success":   False,
-                "message":   f"[{e.retcode}] {e.message}",
+                "message":   msg,
             })
 
     if not found_any:
         logger.info(
             "[REDEEM] Ninguna cuenta registrada tiene el juego {}.", game_biz
         )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Codigos de regalo — sistema automatico
+# ---------------------------------------------------------------------------
+
+async def add_gift_code(
+    ctx: AppContext,
+    game_biz: str,
+    code: str,
+    expires_at: typing.Optional[datetime] = None,
+) -> dict:
+    """
+    Agrega un codigo a la DB para que se canjee automaticamente en
+    todas las cuentas OS que tengan ese juego (via redeem_pending_codes).
+
+    Devuelve dict con success y message.
+    """
+    if game_biz not in config.CODE_URLS:
+        return {
+            "success": False,
+            "message": f"'{game_biz}' no soporta canje de codigos via API.",
+        }
+
+    added = ctx.code_store.add_code(game_biz, code, expires_at=expires_at)
+    if added:
+        return {
+            "success": True,
+            "message": f"Codigo '{code.strip().upper()}' agregado para {config.GAME_BIZ_MAP.get(game_biz, game_biz)}.",
+        }
+    return {
+        "success": True,
+        "message": f"El codigo '{code.strip().upper()}' ya estaba registrado — no se duplico.",
+    }
+
+
+async def redeem_pending_codes(ctx: AppContext) -> list[RedeemResult]:
+    """
+    Canje AUTOMATICO: busca en la DB los codigos activos y no expirados
+    para cada juego de cada cuenta OS, e intenta canjear los que esa
+    cuenta puntual todavia no haya intentado (no tiene fila en
+    code_redemptions).
+
+    A diferencia de redeem_code_for_all(), esto no pide un codigo
+    especifico — recorre TODOS los codigos pendientes de TODAS las
+    cuentas en una sola pasada. Pensado para correr junto (o despues)
+    de las tareas diarias.
+
+    Devuelve lista de RedeemResult (uno por intento realizado).
+    """
+    accounts = ctx.account_store.list_all()
+    os_accounts = [a for a in accounts if a["region"] == "os"]
+    if not os_accounts:
+        logger.info("[REDEEM-AUTO] Ninguna cuenta OS registrada.")
+        return []
+
+    results: list[RedeemResult] = []
+    first_attempt = True
+
+    for account in os_accounts:
+        alias = account["alias"]
+        active = await restore_session(ctx, account)
+        if active is None:
+            logger.warning(
+                "[REDEEM-AUTO] Sesion expirada para '{}'. "
+                "Usa 'Reingresar contrasena' para renovarla.", alias
+            )
+            continue
+
+        for game in active.games:
+            pending = ctx.code_store.get_pending_for_account(alias, game.game_biz)
+            if not pending:
+                continue
+
+            for code_row in pending:
+                if not first_attempt:
+                    await random_delay(*config.DELAY_BETWEEN_REDEEMS)
+                first_attempt = False
+
+                code = code_row["code"]
+                logger.info(
+                    "[REDEEM-AUTO] '{}' | {} | codigo pendiente: {}",
+                    alias, game.GAME_NAME, code
+                )
+                try:
+                    await game.redeem_code(code)
+                    logger.success(
+                        "[REDEEM-AUTO] Canjeado: '{}' | {} | {}",
+                        alias, game.GAME_NAME, code
+                    )
+                    ctx.code_store.record_redemption(
+                        code_row["id"], alias, "success", "Canjeado correctamente."
+                    )
+                    results.append({
+                        "alias": alias, "game_name": game.GAME_NAME,
+                        "uid": game.uid, "success": True,
+                        "message": f"Canjeado: {code}",
+                    })
+                except NotImplementedError:
+                    continue
+                except HoyoAPIError as e:
+                    scope, label = _classify_redeem_error(e)
+                    msg = f"[{e.retcode}] {e.message}"
+                    logger.warning(
+                        "[REDEEM-AUTO] '{}' | {} | {} -> {} ({})",
+                        alias, game.GAME_NAME, code, msg, scope
+                    )
+                    if scope == "global":
+                        ctx.code_store.mark_dead(code_row["id"], msg)
+                    elif scope == "account":
+                        ctx.code_store.record_redemption(
+                            code_row["id"], alias, label, msg
+                        )
+                    # transient: no se guarda nada, se reintenta despues
+                    results.append({
+                        "alias": alias, "game_name": game.GAME_NAME,
+                        "uid": game.uid, "success": False,
+                        "message": f"{code}: {msg}",
+                    })
 
     return results

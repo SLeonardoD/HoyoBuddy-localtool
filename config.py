@@ -387,6 +387,43 @@ REDEEMABLE_GAMES: list[dict[str, str]] = [
     for biz in CODE_URLS
 ]
 
+# Clasificacion de retcodes de canje de codigos, verificada contra el
+# codigo fuente instalado de genshin.py (genshin/errors.py, mapeo
+# _ERRORS -> RedemptionInvalid / RedemptionClaimed / RedemptionCooldown /
+# RedeemGameLevelTooLow). Tres alcances distintos:
+#
+#   GLOBAL     El codigo esta muerto para TODAS las cuentas (invalido,
+#              expirado, formato incorrecto, tope de usos alcanzado).
+#              -> gift_codes.status = 'dead', no se reintenta nunca mas.
+#   ACCOUNT    Definitivo pero solo para ESA cuenta puntual (ya lo
+#              reclamo, o no aplica por region/nivel de personaje).
+#              -> se registra en code_redemptions, esa cuenta no lo
+#                 vuelve a intentar, pero el codigo sigue activo para
+#                 las demas cuentas.
+#   TRANSIENT  Temporal (cooldown, codigo aun no activado, error de
+#              red, o un retcode nuevo que no reconocemos). No se
+#              guarda nada — se reintenta automaticamente en la
+#              proxima corrida. Es el default seguro para retcodes
+#              desconocidos: preferible reintentar de mas que marcar
+#              como muerto algo que en realidad seguia valido.
+REDEEM_GLOBAL_DEAD_RETCODES: frozenset[int] = frozenset({
+    -1065,  # RedemptionInvalid
+    -2001,  # expirado
+    -2003,  # formato incorrecto
+    -2004,  # invalido (generico)
+    -2006,  # tope de usos alcanzado
+})
+REDEEM_ACCOUNT_CLAIMED_RETCODES: frozenset[int] = frozenset({-2017, -2018})
+REDEEM_ACCOUNT_INELIGIBLE_RETCODES: frozenset[int] = frozenset({
+    -2008,  # bloqueado por region/servidor de esta cuenta
+    -2011,  # nivel de personaje insuficiente
+    -2021,  # nivel de personaje insuficiente
+})
+REDEEM_TRANSIENT_RETCODES: frozenset[int] = frozenset({
+    -2016,  # cooldown entre canjes
+    -2014,  # codigo aun no activado (fecha futura)
+})
+
 
 # =============================================================================
 # Anti-deteccion — rangos de delay (segundos, min/max para random.uniform)

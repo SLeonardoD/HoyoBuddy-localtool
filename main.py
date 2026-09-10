@@ -23,16 +23,19 @@ from datetime import datetime
 from loguru import logger
 
 import config
-from db import CookieStore, AccountStore
+from db import AccountStore, GiftCodeStore
 from HoyoWrapper import HoyoManager
 from app import (
     AppContext,
     add_account,
+    relogin_account,
     delete_account,
     list_accounts,
     restore_session,
     run_daily_tasks,
     redeem_code_for_all,
+    add_gift_code,
+    redeem_pending_codes,
     REDEEMABLE_GAMES,
 )
 
@@ -87,7 +90,10 @@ def _print_menu() -> None:
     print("  2. Listar cuentas")
     print("  3. Eliminar cuenta")
     print("  4. Completar tareas diarias")
-    print("  5. Canjear codigo de regalo")
+    print("  5. Canjear codigo de regalo (manual)")
+    print("  6. Agregar codigo de regalo a la base de datos")
+    print("  7. Canjear codigos pendientes (automatico)")
+    print("  8. Reingresar contrasena (sesion expirada)")
     print("  0. Salir")
     print(SEP)
 
@@ -384,12 +390,135 @@ async def _action_redeem(ctx: AppContext) -> None:
 # Bucle principal
 # ---------------------------------------------------------------------------
 
+async def _action_relogin(ctx: AppContext) -> None:
+    """Reingresa la contrasena de una cuenta cuyas cookies expiraron."""
+    print(f"\n{SEP}")
+    print("  REINGRESAR CONTRASENA")
+    print(SEP)
+
+    accounts = list_accounts(ctx)
+    if not accounts:
+        print("  No hay cuentas registradas.")
+        return
+
+    print("  Cuentas disponibles:\n")
+    for i, acc in enumerate(accounts, 1):
+        print(f"    {i}. {acc['alias']} [{acc['region'].upper()}] — {acc['email']}")
+
+    print()
+    alias = _ask("Alias de la cuenta (o Enter para cancelar): ")
+    if not alias:
+        return
+
+    if not any(a["alias"] == alias for a in accounts):
+        logger.warning("No se encontro ninguna cuenta con el alias '{}'.", alias)
+        return
+
+    password = _ask_password("Contrasena: ")
+    if not password:
+        return
+
+    print()
+    logger.info("Reautenticando '{}'...", alias)
+    result = await relogin_account(ctx, alias, password)
+
+    print()
+    if result["success"]:
+        logger.success("Cuenta '{}' reautenticada. Region: {}", alias, result["region"])
+        if result["games"]:
+            logger.info("Juegos detectados:")
+            for g in result["games"]:
+                logger.info("  - {}", g)
+    else:
+        logger.error("Error al reautenticar: {}", result["message"])
+
+
+async def _action_add_gift_code(ctx: AppContext) -> None:
+    """Agrega un codigo de regalo a la DB para canje automatico futuro."""
+    print(f"\n{SEP}")
+    print("  AGREGAR CODIGO DE REGALO")
+    print(SEP)
+    print("  El codigo se guarda para canjearse automaticamente en TODAS")
+    print("  las cuentas OS que tengan el juego (opcion 7).\n")
+
+    print("  Selecciona el juego al que pertenece el codigo:\n")
+    for i, game in enumerate(REDEEMABLE_GAMES, 1):
+        print(f"    {i}. {game['display']}")
+    print()
+
+    game_input = _ask("Numero de juego (o Enter para cancelar): ")
+    if not game_input:
+        return
+
+    try:
+        game_idx = int(game_input) - 1
+        if not (0 <= game_idx < len(REDEEMABLE_GAMES)):
+            raise ValueError
+    except ValueError:
+        print("  Opcion no valida.")
+        return
+
+    selected = REDEEMABLE_GAMES[game_idx]
+
+    print()
+    code = _ask(f"Codigo de {selected['display']}: ")
+    if not code:
+        print("  Operacion cancelada.")
+        return
+
+    result = await add_gift_code(ctx, selected["game_biz"], code)
+    print()
+    if result["success"]:
+        logger.success(result["message"])
+    else:
+        logger.error(result["message"])
+
+
+async def _action_redeem_pending(ctx: AppContext) -> None:
+    """Canjea automaticamente todos los codigos pendientes en todas las cuentas."""
+    print(f"\n{SEP_FAT}")
+    print("  CANJEAR CODIGOS PENDIENTES")
+    print(SEP_FAT)
+
+    accounts = list_accounts(ctx)
+    os_accounts = [a for a in accounts if a["region"] == "os"]
+    if not os_accounts:
+        print("\n  No hay cuentas OS registradas.")
+        return
+
+    print(f"\n  Revisando codigos pendientes en {len(os_accounts)} cuenta(s) OS...")
+    print()
+
+    results = await redeem_pending_codes(ctx)
+
+    print(f"\n{SEP}")
+    print("  RESULTADO")
+    print(SEP)
+
+    if not results:
+        print("\n  No habia codigos pendientes para ninguna cuenta.")
+        return
+
+    ok  = [r for r in results if r["success"]]
+    err = [r for r in results if not r["success"]]
+
+    for r in results:
+        icon = "OK" if r["success"] else "--"
+        print(f"\n  [{icon}] {r['alias']} | {r['game_name']} (uid: {r['uid']})")
+        print(f"       {r['message']}")
+
+    print(f"\n{SEP}")
+    print(f"  Canjes exitosos: {len(ok)}  |  Fallidos/omitidos: {len(err)}")
+    print(SEP)
+
+
 async def run() -> None:
     """Bucle principal de la aplicacion."""
+    store = AccountStore(DB_PATH)
     ctx = AppContext(
-        cookie_store  = CookieStore(DB_PATH),
-        account_store = AccountStore(DB_PATH),
-        manager       = HoyoManager(CookieStore(DB_PATH)),
+        account_store = store,
+        code_store    = GiftCodeStore(DB_PATH),
+        manager       = HoyoManager(store),
     )
 
     _print_header()
@@ -413,12 +542,21 @@ async def run() -> None:
         elif choice == "5":
             await _action_redeem(ctx)
 
+        elif choice == "6":
+            await _action_add_gift_code(ctx)
+
+        elif choice == "7":
+            await _action_redeem_pending(ctx)
+
+        elif choice == "8":
+            await _action_relogin(ctx)
+
         elif choice == "0":
             print("\n  Hasta luego.\n")
             break
 
         else:
-            print("  Opcion no valida. Elige entre 0 y 5.")
+            print("  Opcion no valida. Elige entre 0 y 8.")
 
 
 def main() -> None:
