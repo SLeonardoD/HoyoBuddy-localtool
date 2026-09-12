@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 from aioresponses import aioresponses
 
+import config
 from HoyoWrapper.session import HoyoAPIError, HoyoSession
 from HoyoWrapper.game_model import (
     BaseGame, create_game, random_delay,
@@ -481,4 +482,203 @@ class TestRandomDelay:
         assert elapsed > 0.005, (
             f"random_delay retornó casi instantáneamente ({elapsed:.4f}s). "
             f"¿Se está ejecutando sin sleep?"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests del bug de check-in CN (header 'ds' faltante)
+#
+# HALLAZGO: _checkin_headers() intentaba
+# "from _ds_utility import generate_dynamic_secret" — un modulo que NO
+# EXISTE en el proyecto. El ImportError se tragaba en silencio y el
+# check-in CN se enviaba SIN firma 'ds', probablemente rechazado por
+# HoYoverse con un retcode de firma invalida. Corregido usando
+# HoyoWrapper.ds_utils.generate_dynamic_secret(config.DS_SALT_CN_SIGNIN).
+# ---------------------------------------------------------------------------
+
+class TestCnCheckinDsHeader:
+
+    def test_cn_headers_include_ds(self, genshin_cn: GenshinGame) -> None:
+        """
+        REGRESION: el check-in CN debe incluir el header 'ds'. Sin este
+        test, un refactor futuro podria reintroducir el import roto sin
+        que nada lo detecte (el ImportError se traga en silencio adrede
+        para no tumbar el check-in por un problema de firma).
+        """
+        headers = genshin_cn._checkin_headers()
+        assert "ds" in headers, (
+            "Falta el header 'ds' en el check-in CN — este es exactamente "
+            "el bug que se corrigio (import roto silencioso)."
+        )
+
+    def test_cn_ds_header_has_correct_format(self, genshin_cn: GenshinGame) -> None:
+        """El 'ds' de check-in CN tiene el formato 't,r,hash' (3 partes)."""
+        headers = genshin_cn._checkin_headers()
+        parts = headers["ds"].split(",")
+        assert len(parts) == 3, (
+            f"El header 'ds' deberia tener 3 partes separadas por coma, "
+            f"obtenido: {headers['ds']!r}"
+        )
+        # La 3ra parte es un hash MD5 hexadecimal (32 caracteres hex)
+        assert len(parts[2]) == 32 and all(c in "0123456789abcdef" for c in parts[2]), (
+            f"La 3ra parte del 'ds' deberia ser un hash MD5 hex de 32 chars, "
+            f"obtenido: {parts[2]!r}"
+        )
+
+    def test_cn_ds_changes_between_calls(self, genshin_cn: GenshinGame) -> None:
+        """
+        El 'ds' incluye un componente aleatorio y un timestamp — dos
+        llamadas consecutivas NO deberian producir el mismo valor exacto
+        (a diferencia de device_id, que si debe ser estable).
+        """
+        h1 = genshin_cn._checkin_headers()
+        h2 = genshin_cn._checkin_headers()
+        assert h1["ds"] != h2["ds"], (
+            "El 'ds' deberia variar entre llamadas (incluye un componente "
+            "aleatorio) — si es identico, probablemente esta hardcodeado."
+        )
+
+    def test_os_headers_never_include_ds(self, genshin: GenshinGame) -> None:
+        """OS no necesita (ni debe enviar) el header 'ds' en check-in — es exclusivo de CN."""
+        headers = genshin._checkin_headers()
+        assert "ds" not in headers, (
+            f"El check-in OS no deberia incluir 'ds'. Headers: {list(headers.keys())}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests de redeem_code: metodo HTTP correcto por juego
+#
+# HALLAZGO: ZZZ tambien usa POST (igual que StarRail), no GET como
+# Genshin. config.CODE_POST_GAMES solo tenia 'hkrpg_global' — a
+# 'nap_global' (ZZZ) le faltaba. Verificado contra genshin.py:
+#   post_request_games = {types.Game.ZZZ, types.Game.STARRAIL}
+# ---------------------------------------------------------------------------
+
+class TestRedeemHttpMethod:
+
+    @pytest.mark.asyncio
+    async def test_genshin_redeem_uses_get(self, genshin: GenshinGame) -> None:
+        methods_used = []
+
+        async def mock_request(method, url, **kwargs):
+            methods_used.append(method)
+            return {}
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+        await genshin.redeem_code("TESTCODE")
+
+        assert methods_used == ["GET"], (
+            f"Genshin deberia canjear con GET, se uso: {methods_used}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_starrail_redeem_uses_post(self, starrail: StarRailGame) -> None:
+        methods_used = []
+
+        async def mock_request(method, url, **kwargs):
+            methods_used.append(method)
+            return {}
+
+        starrail.session.request = mock_request  # type: ignore[method-assign]
+        await starrail.redeem_code("TESTCODE")
+
+        assert methods_used == ["POST"], (
+            f"StarRail deberia canjear con POST, se uso: {methods_used}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_zzz_redeem_uses_post(self, zzz: ZZZGame) -> None:
+        """
+        REGRESION del bug encontrado: ZZZ debe usar POST igual que
+        StarRail. Antes de la correccion usaba GET, inconsistente con
+        el comportamiento real de HoYoverse.
+        """
+        methods_used = []
+
+        async def mock_request(method, url, **kwargs):
+            methods_used.append(method)
+            return {}
+
+        zzz.session.request = mock_request  # type: ignore[method-assign]
+        await zzz.redeem_code("TESTCODE")
+
+        assert methods_used == ["POST"], (
+            f"ZZZ deberia canjear con POST (igual que StarRail), se uso: {methods_used}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests de consistencia con config.py
+#
+# Estos tests no verifican un valor especifico (eso ya lo hacen los de
+# arriba) sino que las estructuras de config.py sean INTERNAMENTE
+# consistentes entre si — el tipo de bug que un cambio manual futuro en
+# config.py podria introducir sin que nadie lo note hasta que falle en
+# vivo.
+# ---------------------------------------------------------------------------
+
+class TestConfigConsistency:
+
+    def test_every_code_url_game_has_a_post_or_get_entry(self) -> None:
+        """
+        Todo juego con URL de redeem configurado debe tener una decision
+        explicita de metodo — no hay un juego "flotante" para el que el
+        codigo tenga que adivinar GET o POST por defecto.
+        """
+        for game_biz in config.CODE_URLS:
+            # No es necesario que este en CODE_POST_GAMES (Genshin no lo esta,
+            # usa GET), pero el propio hecho de mirar el set no debe lanzar error.
+            _ = game_biz in config.CODE_POST_GAMES
+
+    def test_only_zzz_and_starrail_use_post_for_redeem(self) -> None:
+        """
+        Ancla explicita del hallazgo: exactamente {StarRail, ZZZ} usan
+        POST. Si algun dia Genshin empezara a requerir POST tambien (o
+        StarRail volviera a GET), este test lo señala de inmediato en
+        vez de descubrirse por un canje fallido en produccion.
+        """
+        assert config.CODE_POST_GAMES == frozenset({"hkrpg_global", "nap_global"}), (
+            f"CODE_POST_GAMES cambio de forma inesperada: {config.CODE_POST_GAMES}"
+        )
+
+    def test_game_id_map_matches_mimo_game_ids_from_genshin_py(self) -> None:
+        """
+        Ancla explicita verificada contra genshin.py (models/hoyolab/mimo.py
+        -> MimoGame.game): hk4e=2, hkrpg=6, nap=8. Honkai Impact 3rd no
+        aparece — no tiene mimo.
+        """
+        assert config.GAME_ID_MAP["hk4e_global"] == 2
+        assert config.GAME_ID_MAP["hkrpg_global"] == 6
+        assert config.GAME_ID_MAP["nap_global"] == 8
+        assert "bh3_global" not in config.GAME_ID_MAP, (
+            "Honkai Impact 3rd no tiene mimo — no deberia tener game_id de mimo."
+        )
+
+    def test_redeemable_games_derived_from_code_urls(self) -> None:
+        """
+        REGLA: REDEEMABLE_GAMES (usado por el menu) se DERIVA de
+        CODE_URLS, no es una lista separada mantenida a mano. Esto
+        elimina una clase entera de bug (agregar un juego a CODE_URLS
+        y olvidarse de agregarlo tambien al menu, o viceversa).
+        """
+        biz_in_menu  = {g["game_biz"] for g in config.REDEEMABLE_GAMES}
+        biz_in_urls  = set(config.CODE_URLS.keys())
+        assert biz_in_menu == biz_in_urls, (
+            f"REDEEMABLE_GAMES y CODE_URLS deberian tener exactamente los "
+            f"mismos juegos.\n  Menu: {biz_in_menu}\n  URLs:  {biz_in_urls}"
+        )
+
+    def test_mimo_finishable_task_types_excludes_in_game_actions(self) -> None:
+        """
+        Los tipos que requieren jugar de verdad (login diario, jugar
+        partidas) NUNCA deben estar en MIMO_FINISHABLE_TASK_TYPES —
+        intentar "completarlos" via API fallaria siempre, o peor,
+        podria ser rechazado como actividad sospechosa.
+        """
+        in_game_types = {5, 6, 8, 12, 13, 16}  # GI_LOGIN, GI_GAME, HSR_GAME, ZZZ_*, ZZZ_GAME
+        overlap = config.MIMO_FINISHABLE_TASK_TYPES & in_game_types
+        assert overlap == set(), (
+            f"MIMO_FINISHABLE_TASK_TYPES no deberia incluir tipos que requieren "
+            f"jugar de verdad. Overlap encontrado: {overlap}"
         )

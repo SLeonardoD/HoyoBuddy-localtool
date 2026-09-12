@@ -13,17 +13,14 @@ import pytest
 import pytest_asyncio
 from aioresponses import aioresponses
 
+import config
 from HoyoWrapper.session import HoyoSession, HoyoAPIError
 from tests.conftest import (
     TEST_COOKIES_OS, TEST_COOKIES_CN, TEST_DEVICE_ID,
 )
 
-GAME_ACCOUNTS_OS_URL = (
-    "https://api-os-takumi.mihoyo.com/binding/api/getUserGameRolesByCookie"
-)
-GAME_ACCOUNTS_CN_URL = (
-    "https://api-takumi.mihoyo.com/binding/api/getUserGameRolesByCookie"
-)
+GAME_ACCOUNTS_OS_URL = config.GAME_ACCOUNTS_OS_URL
+GAME_ACCOUNTS_CN_URL = config.GAME_ACCOUNTS_CN_URL
 
 MOCK_ACCOUNTS_RESPONSE = {
     "retcode": 0,

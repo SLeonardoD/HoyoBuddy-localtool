@@ -22,7 +22,7 @@ from HoyoWrapper.starrail_game import StarRailGame
 from HoyoWrapper.honkai_game import HonkaiGame
 from tests.conftest import (
     TEST_EMAIL, TEST_PASSWORD, TEST_DEVICE_ID,
-    TEST_COOKIES_OS, TEST_ACCOUNTS, MockCookieStore,
+    TEST_COOKIES_OS, TEST_ACCOUNTS, MockAccountStore,
 )
 
 
@@ -223,6 +223,34 @@ class TestCheckinAll:
         )
 
     @pytest.mark.asyncio
+    async def test_delay_uses_config_range_not_hardcoded(self) -> None:
+        """
+        checkin_all() debe pasar config.DELAY_BETWEEN_GAMES a random_delay,
+        no un rango hardcodeado en session_manager.py por separado. Si
+        alguien ajusta el ritmo del bot en config.py, este cambio debe
+        propagarse automaticamente sin tocar session_manager.py.
+        """
+        import config
+        active = _make_active_session()
+        for game in active.games:
+            game.claim_daily_reward = AsyncMock(return_value={
+                "message": "OK", "already_done": False, "total_sign_day": 1,
+            })
+
+        received_args = []
+
+        async def mock_delay(*args, **kwargs):
+            received_args.append(args)
+
+        with patch("HoyoWrapper.session_manager.random_delay", side_effect=mock_delay):
+            await active.checkin_all()
+
+        assert all(args == config.DELAY_BETWEEN_GAMES for args in received_args), (
+            f"random_delay deberia recibir config.DELAY_BETWEEN_GAMES "
+            f"{config.DELAY_BETWEEN_GAMES}, recibio: {received_args}"
+        )
+
+    @pytest.mark.asyncio
     async def test_delay_called_between_games(self) -> None:
         """
         ANTI-DETECCIÓN: checkin_all() llama random_delay entre juegos.
@@ -289,7 +317,7 @@ class TestHoyoManagerLogin:
         login() filtra juegos con game_biz no soportado (e.g. nxx_global — Tears of Themis).
         Solo los juegos soportados aparecen en session.games.
         """
-        mock_store = MockCookieStore()
+        mock_store = MockAccountStore()
         manager = HoyoManager(mock_store)
 
         accounts_with_unsupported = TEST_ACCOUNTS + [
@@ -321,7 +349,7 @@ class TestHoyoManagerLogin:
         """
         Si get_game_accounts() falla tras el login, se lanza LoginError.
         """
-        mock_store = MockCookieStore()
+        mock_store = MockAccountStore()
         manager = HoyoManager(mock_store)
 
         mock_session = HoyoSession(TEST_COOKIES_OS, "os", TEST_DEVICE_ID)
@@ -343,7 +371,7 @@ class TestHoyoManagerLogin:
         """
         HoyoManager.logout() delega en auth_manager.logout().
         """
-        mock_store = MockCookieStore()
+        mock_store = MockAccountStore()
         manager = HoyoManager(mock_store)
 
         with patch.object(manager._auth, "logout", new=AsyncMock()) as mock_logout:

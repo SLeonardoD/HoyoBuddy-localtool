@@ -3,10 +3,68 @@ tests/conftest.py
 -----------------
 Fixtures compartidos entre todos los módulos de test.
 
+===============================================================================
+PRINCIPIOS DE TESTING DE ESTE PROYECTO (aplicables a cualquier lenguaje/
+framework en herramientas futuras basadas en este wrapper)
+===============================================================================
+
+1. Un test = una regla de negocio, no un detalle de implementación.
+   El nombre del test describe el COMPORTAMIENTO esperado ("no reintenta
+   un codigo ya reclamado por esa cuenta"), no el método que se llama
+   ("test_record_redemption"). Si cambia la implementación pero la regla
+   de negocio sigue siendo la misma, el test no debería tener que cambiar.
+
+2. Los mensajes de assert siempre explican QUÉ se esperaba, QUÉ se obtuvo
+   y (cuando aplica) POR QUÉ importa. Un test que falla sin contexto
+   obliga a releer el código fuente para entender qué se rompió; un buen
+   mensaje de assert es autoexplicativo incluso fuera de contexto.
+
+3. Se mockea en el LÍMITE de confianza, no el objeto bajo prueba:
+     - Red (aioresponses)               -> siempre mockeada.
+     - Motor de DB real (SQLite)        -> se usa de verdad (":memory:"),
+       nunca se mockea — la lógica de queries/constraints ES lo que se
+       prueba.
+     - Reloj/delays (random_delay)      -> se mockea para que los tests
+       de anti-detección (que SÍ verifican que hay un delay) no tarden
+       segundos reales.
+   Regla general: si mockear algo hace que el test deje de probar la
+   regla que le da su nombre, no se debe mockear eso.
+
+4. Clasificación de errores por ALCANCE, no por mensaje de texto. Cuando
+   una operación falla, la primera pregunta de diseño es "¿este fallo es
+   definitivo para todo el sistema, definitivo solo para esta entidad
+   puntual, o temporal?" (ver GiftCodeStore: global / account / transient).
+   Tratar todo fallo como "reintentar por siempre" desperdicia recursos;
+   tratar todo fallo como "no reintentar nunca" pierde resultados válidos.
+   Cada categoría tiene su propio test explícito.
+
+5. Idempotencia se prueba explícitamente cuando una operación puede
+   ejecutarse más de una vez con los mismos datos (agregar el mismo
+   código dos veces, reintentar un registro tras un fallo de red). La
+   pregunta del test es "¿el segundo intento corrompe o duplica el
+   primero?", no solo "¿el primer intento funciona?".
+
+6. Anti-detección (o cualquier propiedad de "parecer un humano"/"no
+   generar un patrón detectable") se prueba con números, no con
+   confianza ciega: se verifica que el delay ocurre, que ocurre EXACTAMENTE
+   el número de veces esperado (N-1 para N operaciones secuenciales, nunca
+   antes de la primera), y que valores repetidos (como un device_id)
+   permanecen estables entre llamadas.
+
+7. Los tests nunca duplican valores desde la implementación — importan
+   la MISMA constante que usa el código bajo prueba (config.ACT_IDS,
+   config.GAME_ID_MAP, etc.) en vez de copiar el valor literal. Si el
+   valor cambia en config.py, el test sigue siendo válido sin tocarlo;
+   si en cambio el test tuviera el valor hardcodeado por separado, un
+   cambio legítimo en config.py haría que el test fallara sin que hubiera
+   ningún bug real.
+
+===============================================================================
+
 Provee:
-  - Instancias de CookieStore en memoria (:memory:) — sin archivos en disco.
+  - AccountStore / GiftCodeStore en memoria (:memory:) — sin archivos en disco.
   - HoyoSession de prueba con cookies y device_id fijos.
-  - MockCookieStore para aislar AuthManager de SQLite.
+  - MockAccountStore para aislar AuthManager de SQLite real.
   - Cuentas de juego de prueba (una por juego soportado).
   - Objetos de juego instanciados (GenshinGame, etc.) listos para testear.
 """
@@ -22,7 +80,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 import pytest_asyncio
 
-from db.cookie_store import CookieStore
+import config
+from db.store import AccountStore, GiftCodeStore
 from HoyoWrapper.session import HoyoSession
 from HoyoWrapper.genshin_game import GenshinGame
 from HoyoWrapper.starrail_game import StarRailGame
@@ -42,6 +101,18 @@ TEST_COOKIES_OS = {
     "ltuid_v2":    "123456789",
     "ltoken_v2":   "test_ltoken_os",
     "cookie_token_v2": "test_cookie_token_os",
+}
+
+# Variante que incluye stoken + ltmid_v2 — necesaria para probar el
+# intercambio stoken->cookie_token_v2 (_fetch_cookie_token en
+# auth_manager.py). TEST_COOKIES_OS a secas ya trae cookie_token_v2 y
+# no sirve para probar el CAMINO que lo obtiene.
+TEST_COOKIES_OS_PRE_EXCHANGE = {
+    "ltuid_v2":  "123456789",
+    "ltoken_v2": "test_ltoken_os",
+    "ltmid_v2":  "test_mid_os",
+    "stoken":    "test_stoken_os",
+    # Nota: sin cookie_token_v2 a proposito.
 }
 
 TEST_COOKIES_CN = {
@@ -101,15 +172,15 @@ TEST_ACCOUNT_CN = {
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def cookie_store() -> CookieStore:
-    """CookieStore respaldado por SQLite en memoria. Sin efectos en disco."""
-    return CookieStore(":memory:")
+def account_store() -> AccountStore:
+    """AccountStore respaldado por SQLite en memoria. Sin efectos en disco."""
+    return AccountStore(":memory:")
 
 
 @pytest.fixture
-def cookie_store_file(tmp_path) -> CookieStore:
+def account_store_file(tmp_path) -> AccountStore:
     """
-    CookieStore respaldado por un archivo SQLite temporal real.
+    AccountStore respaldado por un archivo SQLite temporal real.
 
     Necesario para los tests que inspeccionan la DB abriendo una segunda
     conexion sqlite3 directa. SQLite ':memory:' crea una instancia nueva
@@ -118,7 +189,20 @@ def cookie_store_file(tmp_path) -> CookieStore:
     unico por test y lo elimina automaticamente al terminar.
     """
     db_path = str(tmp_path / "test_hoyo.db")
-    return CookieStore(db_path)
+    return AccountStore(db_path)
+
+
+@pytest.fixture
+def code_store() -> GiftCodeStore:
+    """GiftCodeStore respaldado por SQLite en memoria."""
+    return GiftCodeStore(":memory:")
+
+
+@pytest.fixture
+def code_store_file(tmp_path) -> GiftCodeStore:
+    """GiftCodeStore respaldado por un archivo SQLite temporal real."""
+    db_path = str(tmp_path / "test_hoyo_codes.db")
+    return GiftCodeStore(db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -167,12 +251,19 @@ def genshin_cn(session_cn) -> GenshinGame:
 
 
 # ---------------------------------------------------------------------------
-# MockCookieStore
+# MockAccountStore
 # ---------------------------------------------------------------------------
 
-class MockCookieStore:
+class MockAccountStore:
     """
-    CookieStore en memoria pura (sin SQLAlchemy) para aislar AuthManager.
+    Store en memoria pura (sin SQLAlchemy) para aislar AuthManager de
+    SQLite real. Implementa solo la interfaz de SESION que AuthManager
+    necesita (get/set/delete por email+region) — NO implementa la
+    interfaz de alias (set_alias/list_all/etc.), a proposito: AuthManager
+    nunca deberia depender de esa parte de la interfaz, y si algun dia
+    lo hiciera, este mock lo haria fallar de inmediato en vez de pasar
+    por casualidad.
+
     Registra todas las llamadas para poder verificarlas en los tests.
     """
 
@@ -200,5 +291,5 @@ class MockCookieStore:
 
 
 @pytest.fixture
-def mock_store() -> MockCookieStore:
-    return MockCookieStore()
+def mock_store() -> MockAccountStore:
+    return MockAccountStore()
