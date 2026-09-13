@@ -670,7 +670,8 @@ class TestRedeemPendingCodes:
         mock_active.games = [mock_game]
 
         with patch("app.restore_session", new=AsyncMock(return_value=mock_active)):
-            result = await redeem_pending_codes(ctx)
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await redeem_pending_codes(ctx)
 
         assert result == [], "Sin codigos en la DB no deberia intentarse ningun canje."
 
@@ -781,7 +782,8 @@ class TestProcessMimoTasks:
         game.claim_mimo_task_reward = AsyncMock(return_value=None)
         game.finish_mimo_task = AsyncMock(return_value=None)
 
-        result = await _process_mimo_tasks(game)
+        with patch("app.random_delay", new=AsyncMock()):
+            result = await _process_mimo_tasks(game)
 
         claimed  = [r for r in result if r["success"] is True]
         pending  = [r for r in result if not r["success"] and "pendiente" in r["message"].lower()]
@@ -804,7 +806,8 @@ class TestProcessMimoTasks:
         game.finish_mimo_task = AsyncMock(return_value=None)
         game.claim_mimo_task_reward = AsyncMock(return_value=None)
 
-        result = await _process_mimo_tasks(game)
+        with patch("app.random_delay", new=AsyncMock()):
+            result = await _process_mimo_tasks(game)
 
         game.finish_mimo_task.assert_called_once_with(10)
         game.claim_mimo_task_reward.assert_called_once_with(10)
@@ -826,7 +829,8 @@ class TestProcessMimoTasks:
             side_effect=HoyoAPIError(-100, "Error al reclamar", {})
         )
 
-        result = await _process_mimo_tasks(game)
+        with patch("app.random_delay", new=AsyncMock()):
+            result = await _process_mimo_tasks(game)
 
         assert len(result) == 1
         assert result[0]["success"] is False

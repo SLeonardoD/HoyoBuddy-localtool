@@ -259,7 +259,9 @@ class TestClaimDailyReward:
             return {}
 
         genshin.session.request = mock_request  # type: ignore[method-assign]
-        result = await genshin.claim_daily_reward()
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            result = await genshin.claim_daily_reward()
 
         assert result["already_done"] is False, (
             f"already_done deberia ser False tras firmar, obtenido: {result['already_done']}"
@@ -286,6 +288,191 @@ class TestClaimDailyReward:
 
         assert exc_info.value.retcode == -100, (
             f"retcode esperado -100, obtenido: {exc_info.value.retcode}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests de auditoria anti-baneo: ninguna llamada HTTP sin delay humano
+#
+# Estos tests anclan cada hueco encontrado en la auditoria de seguridad:
+# antes, el check-in disparaba /info -> /sign -> /info como 3 requests
+# seguidos sin ninguna espera entre si. Cada test de aca abajo verifica
+# que UN delay especifico existe en UN punto especifico — no solo "que
+# haya algun delay en algun lugar del metodo".
+# ---------------------------------------------------------------------------
+
+class TestCheckinAntiDetectionDelays:
+
+    @pytest.mark.asyncio
+    async def test_delay_between_info_and_sign(self, genshin: GenshinGame) -> None:
+        """
+        HALLAZGO DE AUDITORIA: antes /sign se disparaba inmediatamente
+        despues de /info, sin ninguna pausa — como si el navegador
+        clickeara "firmar" en el mismo instante en que termina de cargar
+        la pagina. Ahora debe haber un delay con el rango de
+        config.DELAY_CHECKIN_INFO_TO_SIGN antes del POST a /sign.
+        """
+        async def mock_request(method: str, url: str, **kwargs):
+            if "/info" in url:
+                return {"is_sign": False, "total_sign_day": 1}
+            return {}
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+
+        received: list[tuple] = []
+
+        async def mock_delay(min_s, max_s):
+            received.append((min_s, max_s))
+
+        with patch("HoyoWrapper.game_model.random_delay", side_effect=mock_delay):
+            await genshin.claim_daily_reward()
+
+        assert config.DELAY_CHECKIN_INFO_TO_SIGN in received, (
+            f"Deberia haberse llamado random_delay con "
+            f"config.DELAY_CHECKIN_INFO_TO_SIGN {config.DELAY_CHECKIN_INFO_TO_SIGN} "
+            f"antes de /sign. Delays recibidos: {received}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_delay_between_sign_and_final_info(self, genshin: GenshinGame) -> None:
+        """
+        HALLAZGO DE AUDITORIA: el /info final (para confirmar el
+        check-in) se disparaba pegado al /sign, sin espera. Ahora debe
+        haber un delay con el rango de config.DELAY_CHECKIN_SIGN_TO_INFO.
+        """
+        async def mock_request(method: str, url: str, **kwargs):
+            if "/info" in url:
+                return {"is_sign": False, "total_sign_day": 1}
+            return {}
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+
+        received: list[tuple] = []
+
+        async def mock_delay(min_s, max_s):
+            received.append((min_s, max_s))
+
+        with patch("HoyoWrapper.game_model.random_delay", side_effect=mock_delay):
+            await genshin.claim_daily_reward()
+
+        assert config.DELAY_CHECKIN_SIGN_TO_INFO in received, (
+            f"Deberia haberse llamado random_delay con "
+            f"config.DELAY_CHECKIN_SIGN_TO_INFO {config.DELAY_CHECKIN_SIGN_TO_INFO} "
+            f"despues de /sign. Delays recibidos: {received}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_delay_when_already_signed(self, genshin: GenshinGame) -> None:
+        """
+        Si ya se firmo hoy (is_sign=True), no se llega a disparar /sign
+        ni sus delays asociados — no tiene sentido simular una espera
+        para una accion que no va a ocurrir.
+        """
+        async def mock_request(method: str, url: str, **kwargs):
+            return {"is_sign": True, "total_sign_day": 10}
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()) as mock_delay:
+            await genshin.claim_daily_reward()
+
+        mock_delay.assert_not_called()
+
+
+class TestMimoAntiDetectionDelays:
+
+    @pytest.mark.asyncio
+    async def test_delay_after_fresh_version_id_fetch(self, genshin: GenshinGame) -> None:
+        """
+        HALLAZGO DE AUDITORIA: _get_mimo_version_id() (un request) era
+        seguido inmediatamente por la accion real de mimo (otro request)
+        sin ninguna espera. Ahora debe haber un delay de
+        config.DELAY_MIMO_VERSION_TO_ACTION la primera vez que se
+        obtiene el version_id (no cacheado todavia).
+        """
+        async def mock_request(method: str, url: str, **kwargs):
+            if "index" in url:
+                return {"act_list": [{"act_info": {"game_id": 2, "version_id": 5}}]}
+            return {"task_list": []}
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+
+        received: list[tuple] = []
+
+        async def mock_delay(min_s, max_s):
+            received.append((min_s, max_s))
+
+        with patch("HoyoWrapper.game_model.random_delay", side_effect=mock_delay):
+            await genshin.get_mimo_tasks()
+
+        assert config.DELAY_MIMO_VERSION_TO_ACTION in received, (
+            f"Deberia haberse llamado random_delay con "
+            f"config.DELAY_MIMO_VERSION_TO_ACTION tras obtener el version_id. "
+            f"Delays recibidos: {received}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_delay_on_cached_version_id(self, genshin: GenshinGame) -> None:
+        """
+        La segunda vez que se necesita el version_id dentro de la misma
+        instancia de juego, viene de cache — no debe volver a pagarse el
+        delay de "cargar la pagina del mimo" (ya esta cargada).
+        """
+        async def mock_request(method: str, url: str, **kwargs):
+            if "index" in url:
+                return {"act_list": [{"act_info": {"game_id": 2, "version_id": 5}}]}
+            return {"task_list": []}
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()) as mock_delay:
+            await genshin.get_mimo_tasks()  # 1ra vez: fetch + delay
+            mock_delay.reset_mock()
+            await genshin.get_mimo_tasks()  # 2da vez: cache, sin delay de version_id
+
+        version_id_delay_calls = [
+            c for c in mock_delay.call_args_list
+            if c.args == config.DELAY_MIMO_VERSION_TO_ACTION
+        ]
+        assert version_id_delay_calls == [], (
+            "No deberia repetirse el delay de version_id en una llamada "
+            "posterior que ya tiene el version_id cacheado."
+        )
+
+    @pytest.mark.asyncio
+    async def test_delay_before_every_purchase_including_first(self, genshin: GenshinGame) -> None:
+        """
+        HALLAZGO DE AUDITORIA: antes el delay entre compras se saltaba
+        para la PRIMERA compra de la lista (solo se aplicaba "entre"
+        compras, nunca antes de la primera). Ahora debe aplicarse
+        tambien antes del primer item.
+        """
+        async def mock_request(method: str, url: str, **kwargs):
+            if url.endswith("/index"):
+                return {"act_list": [{"act_info": {"game_id": 2, "version_id": 5}}]}
+            if url.endswith("exchange_list") or url.endswith("exchange-list"):
+                return {"exchange_award_list": [
+                    {"name": "Genesis Crystals", "award_id": 1, "cost": 100},
+                ]}
+            if url.endswith("/exchange"):
+                return {"exchange_code": "CODE123"}
+            return {}
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+
+        purchase_delay_calls = []
+
+        async def mock_delay(min_s, max_s):
+            if (min_s, max_s) == config.DELAY_BETWEEN_MIMO_PURCHASES:
+                purchase_delay_calls.append(1)
+
+        with patch("HoyoWrapper.game_model.random_delay", side_effect=mock_delay):
+            await genshin.buy_mimo_currency()
+
+        assert len(purchase_delay_calls) == 1, (
+            f"Con 1 sola compra en la lista, deberia haber exactamente 1 delay "
+            f"de DELAY_BETWEEN_MIMO_PURCHASES (antes se saltaba para la primera). "
+            f"Delays de compra registrados: {len(purchase_delay_calls)}"
         )
 
 

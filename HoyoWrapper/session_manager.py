@@ -160,6 +160,11 @@ class HoyoManager:
         """
         hoyo_session = await self._auth.login(email, password, region=region)
 
+        # ANTI-BANEO: pausa entre terminar el login (con o sin captcha)
+        # y la primera consulta de cuentas de juego vinculadas — antes
+        # salia pegada al login sin ninguna espera.
+        await random_delay(*config.DELAY_AFTER_LOGIN)
+
         try:
             accounts = await hoyo_session.get_game_accounts()
         except HoyoAPIError as e:

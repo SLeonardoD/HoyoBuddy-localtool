@@ -312,6 +312,37 @@ class TestCheckinAll:
 class TestHoyoManagerLogin:
 
     @pytest.mark.asyncio
+    async def test_delay_after_login_before_fetching_accounts(self) -> None:
+        """
+        HALLAZGO DE AUDITORIA ANTI-BANEO: antes, apenas terminaba el
+        login (con o sin captcha), se disparaba de inmediato la consulta
+        de cuentas de juego vinculadas — cero espera entre "loguearse" y
+        "mirar mis cuentas". Ahora debe haber un delay con el rango de
+        config.DELAY_AFTER_LOGIN entre ambos pasos.
+        """
+        import config
+        mock_store = MockAccountStore()
+        manager = HoyoManager(mock_store)
+
+        mock_session = HoyoSession(TEST_COOKIES_OS, "os", TEST_DEVICE_ID)
+        mock_session.get_game_accounts = AsyncMock(return_value=TEST_ACCOUNTS)
+
+        received: list[tuple] = []
+
+        async def mock_delay(min_s, max_s):
+            received.append((min_s, max_s))
+
+        with patch.object(manager._auth, "login", new=AsyncMock(return_value=mock_session)):
+            with patch("HoyoWrapper.session_manager.random_delay", side_effect=mock_delay):
+                await manager.login(TEST_EMAIL, TEST_PASSWORD)
+
+        assert config.DELAY_AFTER_LOGIN in received, (
+            f"Deberia haberse llamado random_delay con config.DELAY_AFTER_LOGIN "
+            f"{config.DELAY_AFTER_LOGIN} entre el login y get_game_accounts(). "
+            f"Delays recibidos: {received}"
+        )
+
+    @pytest.mark.asyncio
     async def test_filters_unsupported_game_biz(self) -> None:
         """
         login() filtra juegos con game_biz no soportado (e.g. nxx_global — Tears of Themis).
@@ -330,7 +361,8 @@ class TestHoyoManagerLogin:
         mock_session.get_game_accounts = AsyncMock(return_value=accounts_with_unsupported)
 
         with patch.object(manager._auth, "login", new=AsyncMock(return_value=mock_session)):
-            active = await manager.login(TEST_EMAIL, TEST_PASSWORD)
+            with patch("HoyoWrapper.session_manager.random_delay", new=AsyncMock()):
+                active = await manager.login(TEST_EMAIL, TEST_PASSWORD)
 
         unsupported = [g for g in active.games if g.game_biz == "nxx_global"]
         assert len(unsupported) == 0, (
@@ -358,8 +390,9 @@ class TestHoyoManagerLogin:
         )
 
         with patch.object(manager._auth, "login", new=AsyncMock(return_value=mock_session)):
-            with pytest.raises(LoginError) as exc_info:
-                await manager.login(TEST_EMAIL, TEST_PASSWORD)
+            with patch("HoyoWrapper.session_manager.random_delay", new=AsyncMock()):
+                with pytest.raises(LoginError) as exc_info:
+                    await manager.login(TEST_EMAIL, TEST_PASSWORD)
 
         assert "cuentas" in str(exc_info.value).lower() or "accounts" in str(exc_info.value).lower(), (
             f"El mensaje de LoginError debería mencionar el error de cuentas.\n"

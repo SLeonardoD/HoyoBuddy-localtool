@@ -431,12 +431,87 @@ REDEEM_TRANSIENT_RETCODES: frozenset[int] = frozenset({
 # todo el codigo. Nombrados por el contexto donde se usan.
 # =============================================================================
 
-DELAY_BETWEEN_ACCOUNTS: tuple[float, float] = (2.0, 5.0)
-DELAY_BETWEEN_GAMES: tuple[float, float] = (1.0, 3.0)
-DELAY_BETWEEN_MIMO_TASKS: tuple[float, float] = (0.8, 2.0)
-DELAY_BETWEEN_MIMO_PURCHASES: tuple[float, float] = (1.5, 4.0)
-DELAY_BETWEEN_REDEEMS: tuple[float, float] = (6.0, 10.0)
-DELAY_CAPTCHA_HUMAN: tuple[float, float] = (3.0, 5.0)
+# =============================================================================
+# Anti-deteccion — rangos de delay (segundos, min/max para random.uniform)
+#
+# AUDITORIA DE SEGURIDAD ANTI-BANEO: cada rango de aca abajo cubre un
+# hueco especifico encontrado revisando CADA metodo que hace una llamada
+# HTTP. La regla es: ninguna llamada a HoYoverse sale sin que antes haya
+# pasado un delay humano — ni siquiera las que estan "adentro" de un
+# metodo (ej. check-in hace 3 requests internos: /info, /sign, /info de
+# nuevo; antes NINGUNO de esos 3 tenia espera entre si).
+#
+# Los valores son deliberadamente generosos, no el minimo que "funciona".
+# Un usuario real no hace click instantaneo apenas carga la pagina, y
+# una llamada a la API es mucho mas rapida que cargar/renderizar una
+# pagina web real con imagenes, JS, etc. — por eso estos delays son mas
+# largos que el tiempo de reaccion humano puro: incluyen tiempo de
+# "carga de pagina" encima del tiempo de "leer y decidir clickear".
+# Preferimos que el proceso tarde mas antes que arriesgar una cuenta.
+# =============================================================================
+
+# Cambiar de cuenta = cerrar sesion/cambiar de pestaña por completo.
+# Es la transicion "mas grande" del flujo — el rango mas largo.
+DELAY_BETWEEN_ACCOUNTS: tuple[float, float] = (8.0, 18.0)
+
+# Cambiar de juego dentro de la misma cuenta = navegar a otra seccion/
+# tab de HoYoLab (Genshin -> Star Rail, etc.).
+DELAY_BETWEEN_GAMES: tuple[float, float] = (4.0, 9.0)
+
+# Dentro del check-in: /info (cargar pagina) -> /sign (click) -> /info
+# (confirmar). Antes esto se disparaba como 3 requests seguidos sin
+# ninguna espera — el hueco mas obvio de toda la auditoria.
+DELAY_CHECKIN_INFO_TO_SIGN: tuple[float, float] = (2.0, 5.0)
+DELAY_CHECKIN_SIGN_TO_INFO: tuple[float, float] = (1.0, 3.0)
+
+# Entre completar/reclamar cada tarea mimo individual (leer la tarea,
+# click, esperar confirmacion).
+DELAY_BETWEEN_MIMO_TASKS: tuple[float, float] = (2.0, 5.0)
+
+# Entre cada compra en la tienda mimo — incluye SIEMPRE la primera
+# compra (antes se saltaba el delay antes del primer item de la lista).
+DELAY_BETWEEN_MIMO_PURCHASES: tuple[float, float] = (3.0, 7.0)
+
+# Primera vez que se pide el indice/version_id del mimo (una request)
+# hasta la accion real (task-list/finish-task/receive-point/exchange-list,
+# otra request) — simula cargar la pagina del mimo antes de interactuar
+# con una pestaña especifica. Solo se paga una vez por juego por
+# ejecucion (el version_id se cachea despues).
+DELAY_MIMO_VERSION_TO_ACTION: tuple[float, float] = (1.5, 4.0)
+
+# Navegar de la seccion de check-in a la seccion de Mimo Viajero —
+# antes esto pasaba con delay CERO (checkin -> get_mimo_tasks() en la
+# misma iteracion, sin ninguna espera entre medio).
+DELAY_CHECKIN_TO_MIMO: tuple[float, float] = (3.0, 7.0)
+
+# Navegar de la pestaña de tareas del mimo a la pestaña de tienda/canje
+# — antes tambien con delay CERO.
+DELAY_MIMO_TASKS_TO_SHOP: tuple[float, float] = (2.5, 6.0)
+
+# Justo despues de restaurar/validar una sesion (pagina recien
+# "cargada") y ANTES de la primera accion real sobre esa cuenta — a
+# diferencia de DELAY_BETWEEN_ACCOUNTS (que se salta para la primera
+# cuenta de la corrida), este SIEMPRE se aplica, primera cuenta incluida.
+DELAY_AFTER_SESSION_RESTORE: tuple[float, float] = (1.5, 4.0)
+
+# Entre el login (POST credenciales) y la request de intercambio
+# stoken->cookie_token_v2 — antes se disparaban una detras de la otra.
+DELAY_LOGIN_TO_COOKIE_EXCHANGE: tuple[float, float] = (1.5, 3.5)
+
+# Entre terminar el login (con o sin captcha) y la primera consulta de
+# cuentas de juego vinculadas (getUserGameRolesByCookie) — antes con
+# delay CERO justo despues de autenticar.
+DELAY_AFTER_LOGIN: tuple[float, float] = (2.0, 5.0)
+
+# Entre canjes de codigo de regalo en cuentas distintas. HoYoverse aplica
+# su propio cooldown del lado del servidor para este endpoint en
+# particular — rango mas largo que el resto a proposito.
+DELAY_BETWEEN_REDEEMS: tuple[float, float] = (10.0, 18.0)
+
+# Delay humano antes de enviar el resultado de un captcha ya resuelto
+# (simula el tiempo que tarda una persona en arrastrar/clickear el
+# widget de Geetest, no solo un reflejo instantaneo).
+DELAY_CAPTCHA_HUMAN: tuple[float, float] = (3.5, 6.5)
 
 
 # =============================================================================

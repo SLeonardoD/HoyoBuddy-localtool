@@ -403,6 +403,41 @@ class TestFetchCookieToken:
 # Tests de auto-reparacion (login() repara sesiones viejas sin cookie_token_v2)
 # ---------------------------------------------------------------------------
 
+    @pytest.mark.asyncio
+    async def test_delay_between_login_and_cookie_exchange(self, mock_store: MockAccountStore) -> None:
+        """
+        HALLAZGO DE AUDITORIA ANTI-BANEO: el POST de login y la request
+        de intercambio stoken->cookie_token_v2 se disparaban una detras
+        de la otra sin pausa. Ahora debe haber un delay con el rango de
+        config.DELAY_LOGIN_TO_COOKIE_EXCHANGE entre ambos.
+        """
+        auth = AuthManager(mock_store)
+
+        fake_login_response = {
+            "retcode": 0, "message": "OK",
+            "data": {"stoken": "test_stoken_os"},
+            "cookies": {"ltuid_v2": "1", "ltoken_v2": "t", "ltmid_v2": "m"},
+        }
+
+        received: list[tuple] = []
+
+        async def mock_delay(min_s, max_s):
+            received.append((min_s, max_s))
+
+        with patch.object(auth, "_raw_post", new=AsyncMock(return_value=fake_login_response)):
+            with patch.object(auth, "_fetch_cookie_token", new=AsyncMock(
+                return_value={"cookie_token_v2": "x"}
+            )):
+                with patch("HoyoWrapper.auth_manager.random_delay", side_effect=mock_delay):
+                    await auth._os_login_flow(TEST_EMAIL, TEST_PASSWORD)
+
+        assert config.DELAY_LOGIN_TO_COOKIE_EXCHANGE in received, (
+            f"Deberia haberse llamado random_delay con "
+            f"config.DELAY_LOGIN_TO_COOKIE_EXCHANGE {config.DELAY_LOGIN_TO_COOKIE_EXCHANGE} "
+            f"antes del intercambio. Delays recibidos: {received}"
+        )
+
+
 class TestAutoRepairOnRestore:
 
     @pytest.mark.asyncio
@@ -422,7 +457,8 @@ class TestAutoRepairOnRestore:
                 "retcode": 0,
                 "data": {"tokens": [{"token_type": 4, "token": "repaired_token"}]},
             })
-            session = await auth.login(TEST_EMAIL, TEST_PASSWORD, region="os")
+            with patch("HoyoWrapper.auth_manager.random_delay", new=AsyncMock()):
+                session = await auth.login(TEST_EMAIL, TEST_PASSWORD, region="os")
 
         assert session.cookies.get("cookie_token_v2") == "repaired_token", (
             f"La sesion devuelta deberia tener el cookie_token_v2 reparado.\n"
@@ -498,7 +534,8 @@ class TestAutoRepairOnRestore:
             with patch.object(auth, "_fetch_cookie_token", new=AsyncMock(
                 return_value={"cookie_token_v2": "brand_new_token"}
             )) as mock_fetch:
-                cookies, device_id = await auth._os_login_flow(TEST_EMAIL, TEST_PASSWORD)
+                with patch("HoyoWrapper.auth_manager.random_delay", new=AsyncMock()):
+                    cookies, device_id = await auth._os_login_flow(TEST_EMAIL, TEST_PASSWORD)
 
         mock_fetch.assert_awaited_once()
         assert cookies.get("cookie_token_v2") == "brand_new_token", (

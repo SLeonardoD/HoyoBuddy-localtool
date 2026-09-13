@@ -384,6 +384,11 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
             })
             continue
 
+        # ANTI-BANEO: pausa "recien cargo la pagina" antes de la primera
+        # accion sobre esta cuenta. A diferencia del delay entre cuentas
+        # (que se salta para la primera), este se aplica siempre.
+        await random_delay(*config.DELAY_AFTER_SESSION_RESTORE)
+
         task_results = await _process_account_games(active, alias)
 
         results.append({
@@ -440,10 +445,17 @@ async def _process_account_games(
             })
 
         # ── Mimo: tareas ─────────────────────────────────────────────
+        # ANTI-BANEO: antes esto arrancaba apenas terminaba el check-in,
+        # sin ninguna espera — como si el navegador saltara de pagina
+        # instantaneamente. Simula el tiempo de navegar a la seccion mimo.
+        await random_delay(*config.DELAY_CHECKIN_TO_MIMO)
         mimo_tasks = await _process_mimo_tasks(game)
         tasks.extend(mimo_tasks)
 
         # ── Mimo: compra de moneda ───────────────────────────────────
+        # ANTI-BANEO: idem, transicion de la pestaña de tareas a la de
+        # tienda dentro del mismo mimo — antes tambien sin espera.
+        await random_delay(*config.DELAY_MIMO_TASKS_TO_SHOP)
         mimo_buys = await _process_mimo_buys(game)
         tasks.extend(mimo_buys)
 
@@ -515,7 +527,7 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
         task_name = task.get("task_name") or task.get("name") or f"Tarea #{task_id}"
         task_type = task.get("task_type") or task.get("type")
 
-        await asyncio.sleep(round(random.uniform(*config.DELAY_BETWEEN_MIMO_TASKS), 2))
+        await random_delay(*config.DELAY_BETWEEN_MIMO_TASKS)
 
         try:
             await game.finish_mimo_task(task_id)
@@ -544,7 +556,7 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
         task_id   = task.get("task_id") or task.get("id")
         task_name = task.get("task_name") or task.get("name") or f"Tarea #{task_id}"
 
-        await asyncio.sleep(round(random.uniform(*config.DELAY_BETWEEN_MIMO_TASKS), 2))
+        await random_delay(*config.DELAY_BETWEEN_MIMO_TASKS)
 
         try:
             await game.claim_mimo_task_reward(task_id)
@@ -753,6 +765,10 @@ async def redeem_code_for_all(
             )
             continue
 
+        # ANTI-BANEO: pausa entre restaurar la sesion (una request) y el
+        # intento de canje (otra request) — antes salian pegadas.
+        await random_delay(*config.DELAY_AFTER_SESSION_RESTORE)
+
         found_any = True
         logger.info(
             "[REDEEM] '{}' tiene {} (uid={}). Intentando canje del codigo '{}'...",
@@ -885,6 +901,10 @@ async def redeem_pending_codes(ctx: AppContext) -> list[RedeemResult]:
                 "Usa 'Reingresar contrasena' para renovarla.", alias
             )
             continue
+
+        # ANTI-BANEO: pausa entre restaurar la sesion y empezar a mirar
+        # codigos pendientes para esta cuenta — antes salian pegadas.
+        await random_delay(*config.DELAY_AFTER_SESSION_RESTORE)
 
         for game in active.games:
             pending = ctx.code_store.get_pending_for_account(alias, game.game_biz)

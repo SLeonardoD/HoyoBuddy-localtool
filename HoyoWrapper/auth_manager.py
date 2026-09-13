@@ -25,6 +25,7 @@ from loguru import logger
 
 import config
 from HoyoWrapper import ds_utils
+from HoyoWrapper.timing import random_delay
 from HoyoWrapper.captcha_server import SessionMMT, SessionMMTResult, enter_code, solve_geetest
 from HoyoWrapper.session import HoyoAPIError, HoyoSession, LoginError
 
@@ -207,6 +208,10 @@ class AuthManager:
                                 "[AUTH] Sesion sin cookie_token_v2 (sesion "
                                 "previa al fix de redeem). Reparando..."
                             )
+                            # ANTI-BANEO: pausa antes de la request de
+                            # intercambio, en vez de dispararla pegada al
+                            # login/restauracion.
+                            await random_delay(*config.DELAY_LOGIN_TO_COOKIE_EXCHANGE)
                             extra = await self._fetch_cookie_token(cookies)
                             if extra:
                                 cookies.update(extra)
@@ -239,7 +244,7 @@ class AuthManager:
             # 3. El error es de credenciales (no de captcha ni de red)
             # Un error de captcha significa que OS reconocio el email — no tiene
             # sentido intentar CN, y ademas miyoushe.com no es accesible fuera de China.
-            credential_errors = {-3001, -3002, -3003}
+            credential_errors = config.CREDENTIAL_ERROR_RETCODES
             is_credential_error = any(
                 f"[{code}]" in str(e) or _MESSAGES_FOR_FALLBACK.get(code) in str(e)
                 for code in credential_errors
@@ -337,6 +342,10 @@ class AuthManager:
             # Sin esto redeem_code() falla con -1071 aunque check-in/mimo
             # funcionen perfecto (esos no lo necesitan).
             if "cookie_token_v2" not in cookies:
+                # ANTI-BANEO: pausa entre el POST de login y la request
+                # de intercambio de token — antes salian una detras de
+                # la otra sin ninguna espera.
+                await random_delay(*config.DELAY_LOGIN_TO_COOKIE_EXCHANGE)
                 extra = await self._fetch_cookie_token(cookies)
                 cookies.update(extra)
 

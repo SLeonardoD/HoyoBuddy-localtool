@@ -21,8 +21,6 @@ Tipos de tareas mimo completables via finish_mimo_task:
 
 from __future__ import annotations
 
-import asyncio
-import random
 import time
 import typing
 
@@ -34,6 +32,7 @@ if typing.TYPE_CHECKING:
 
 import config
 from HoyoWrapper import ds_utils
+from HoyoWrapper.timing import random_delay
 from HoyoWrapper.session import HoyoAPIError
 
 __all__ = [
@@ -72,22 +71,12 @@ _DS_SALT_CN_SIGNIN = config.DS_SALT_CN_SIGNIN
 
 # ---------------------------------------------------------------------------
 # Utilidades anti-deteccion
+#
+# random_delay() vive en HoyoWrapper/timing.py (compartido con
+# auth_manager.py) — se re-importa y re-exporta aca para no romper el
+# import existente `from HoyoWrapper.game_model import random_delay`
+# usado en app.py, session_manager.py y los tests.
 # ---------------------------------------------------------------------------
-
-async def random_delay(
-    min_s: float = config.DELAY_BETWEEN_GAMES[0],
-    max_s: float = config.DELAY_BETWEEN_GAMES[1],
-) -> None:
-    """
-    Espera aleatoria con decimales entre operaciones para evitar patrones
-    de timing robotico. Valores tipicos: 1.3s, 2.7s, etc.
-    Default tomado de config.DELAY_BETWEEN_GAMES; los llamadores pasan
-    otros rangos de config.DELAY_* segun el contexto (cuentas, redeems, etc.).
-    """
-    delay = round(random.uniform(min_s, max_s), 2)
-    logger.debug("[GAME] Anti-deteccion: delay de {}s.", delay)
-    await asyncio.sleep(delay)
-
 
 def _is_rate_limit(exc: BaseException) -> bool:
     """True si la excepcion es un rate limit de HoYoverse."""
@@ -298,6 +287,11 @@ class BaseGame:
                 "total_sign_day": info["total_sign_day"],
             }
 
+        # ANTI-BANEO: un usuario real lee la pagina de check-in (que ya
+        # cargo con la info de arriba) antes de hacer click en "firmar".
+        # Antes esto disparaba /sign inmediatamente despues de /info.
+        await random_delay(*config.DELAY_CHECKIN_INFO_TO_SIGN)
+
         sign_url = f"{self._reward_base_url}/sign"
         logger.debug(
             "[CHECKIN] Enviando POST a /sign | game={} uid={} url={}",
@@ -321,6 +315,10 @@ class BaseGame:
                 self.GAME_NAME, self.uid, e.retcode, e.message, e.raw
             )
             raise
+
+        # ANTI-BANEO: espera antes de refrescar el estado, como haria
+        # una pagina real esperando la confirmacion visual del check-in.
+        await random_delay(*config.DELAY_CHECKIN_SIGN_TO_INFO)
 
         info_after = await self.get_daily_reward_info(lang=lang)
         logger.info(
@@ -430,6 +428,11 @@ class BaseGame:
             "[MIMO] version_id obtenido | game={} version_id={}",
             self.GAME_NAME, self._mimo_version_id
         )
+        # ANTI-BANEO: simula cargar la pagina/pestaña del mimo antes de
+        # interactuar con ella. Solo se paga esta vez por instancia —
+        # las siguientes llamadas usan el version_id cacheado y no
+        # vuelven a pasar por aca.
+        await random_delay(*config.DELAY_MIMO_VERSION_TO_ACTION)
         return self._mimo_version_id
 
     async def get_mimo_tasks(self, *, lang: str = "en") -> list[dict]:
@@ -605,7 +608,6 @@ class BaseGame:
         items = await self.get_mimo_shop_items(lang=lang)
         version_id = await self._get_mimo_version_id()
         results: list[dict] = []
-        first = True
 
         for item in items:
             name_lower = item.get("name", "").lower()
@@ -615,9 +617,12 @@ class BaseGame:
             if not award_id:
                 continue
 
-            if not first:
-                await random_delay(*config.DELAY_BETWEEN_MIMO_PURCHASES)
-            first = False
+            # ANTI-BANEO: antes este delay se saltaba para la primera
+            # compra de la lista (solo se aplicaba "entre" compras). Un
+            # usuario real tambien tarda en decidirse a comprar el
+            # PRIMER item, no solo entre el 2do y 3ro — asi que ahora se
+            # aplica siempre, sin excepcion para el primero.
+            await random_delay(*config.DELAY_BETWEEN_MIMO_PURCHASES)
 
             url = self._mimo_url("exchange")
             body = {
