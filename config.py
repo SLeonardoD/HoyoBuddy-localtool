@@ -350,10 +350,20 @@ CURRENCY_ITEM_KEYWORDS: dict[str, list[str]] = {
 # =============================================================================
 
 CODE_URLS: dict[str, str] = {
-    "hk4e_global":  "https://sg-hk4e-api.hoyoverse.com/common/apicdkey/api/webExchangeCdkey",
-    "hkrpg_global": "https://sg-hkrpg-api.hoyoverse.com/common/apicdkey/api/webExchangeCdkeyRisk",
-    "nap_global":   "https://public-operation-nap.hoyoverse.com/common/apicdkey/api/webExchangeCdkey",
+    "hk4e_global":  "https://public-operation-hk4e.hoyoverse.com/common/apicdkey/api/webExchangeCdkey",
+    "hkrpg_global": "https://public-operation-hkrpg.hoyoverse.com/common/apicdkey/api/webExchangeCdkeyRisk",
+    "nap_global":   "https://public-operation-nap.hoyoverse.com/common/apicdkey/api/webExchangeCdkeyRisk",
 }
+# HISTORIAL DE ESTE VALOR (para que la proxima vez que cambie no
+# sorprenda): la version anterior de estas URLs usaba dominios
+# "sg-hk4e-api.hoyoverse.com" / "sg-hkrpg-api.hoyoverse.com", y nap
+# apuntaba a "webExchangeCdkey" (SIN "Risk"). Eso produjo un error real
+# en vivo: retcode HTTP 405 "Method Not Allowed" al hacer POST a la URL
+# vieja de nap, porque esa URL (sin Risk) solo acepta GET — el sufijo
+# "Risk" es el que habilita POST del lado del servidor. Verificado de
+# nuevo leyendo el codigo fuente instalado de genshin.py (routes.py),
+# que es la fuente de verdad: los 3 juegos ahora resuelven a dominios
+# "public-operation-<juego>.hoyoverse.com" (sin el prefijo "sg-").
 
 # StarRail y ZZZ usan POST para redeem. Solo Genshin usa GET.
 # Fuente: hoyolab.py redeem_code():
