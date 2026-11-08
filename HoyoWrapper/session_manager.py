@@ -149,6 +149,7 @@ class HoyoManager:
         password: str,
         *,
         region: typing.Optional[typing.Literal["os", "cn"]] = None,
+        force_fresh: bool = False,
     ) -> ActiveSession:
         """
         Autentica y devuelve ActiveSession con los juegos del usuario listos.
@@ -158,7 +159,9 @@ class HoyoManager:
         Lanza:
             LoginError  Credenciales incorrectas.
         """
-        hoyo_session = await self._auth.login(email, password, region=region)
+        hoyo_session = await self._auth.login(
+            email, password, region=region, force_fresh=force_fresh,
+        )
 
         # ANTI-BANEO: pausa entre terminar el login (con o sin captcha)
         # y la primera consulta de cuentas de juego vinculadas — antes
@@ -178,6 +181,16 @@ class HoyoManager:
                     len(supported), hoyo_session.account_id)
 
         return ActiveSession(hoyo_session, supported)
+
+    async def renew_cookie_token(
+        self, email: str, region: str, cookies: dict, device_id: str,
+    ) -> bool:
+        """
+        Renueva el cookie_token_v2 (necesario para canjear codigos).
+        Delega en AuthManager.renew_cookie_token(); expuesto aca para que
+        app.py no acceda al AuthManager interno. Ver ese metodo.
+        """
+        return await self._auth.renew_cookie_token(email, region, cookies, device_id)
 
     async def logout(self, email: str) -> None:
         """Elimina las cookies del usuario del store."""

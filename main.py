@@ -36,6 +36,7 @@ from app import (
     redeem_code_for_all,
     add_gift_code,
     redeem_pending_codes,
+    get_token_report,
     REDEEMABLE_GAMES,
 )
 
@@ -94,6 +95,7 @@ def _print_menu() -> None:
     print("  6. Agregar codigo de regalo a la base de datos")
     print("  7. Canjear codigos pendientes (automatico)")
     print("  8. Reingresar contrasena (sesion expirada)")
+    print("  9. Ver medicion de sesiones (vida util del token)")
     print("  0. Salir")
     print(SEP)
 
@@ -275,6 +277,8 @@ def _print_daily_summary(result: dict) -> None:
 
         tasks = acc_result.get("tasks", [])
         print(f"\n  {alias} [{region}]")
+        for warning in acc_result.get("warnings", []):
+            print(f"    [!] {warning}")
 
         if not tasks:
             print(f"    Sin juegos soportados vinculados a esta cuenta.")
@@ -512,6 +516,45 @@ async def _action_redeem_pending(ctx: AppContext) -> None:
     print(SEP)
 
 
+def _fmt_hours(hours) -> str:
+    return f"{hours:.1f} h" if hours is not None else "sin datos"
+
+
+def _action_token_report(ctx: AppContext) -> None:
+    """Muestra la medicion de vida util del cookie_token_v2."""
+    print(f"\n{SEP_FAT}")
+    print("  MEDICION DE SESIONES (cookie_token_v2)")
+    print(SEP_FAT)
+
+    report = get_token_report(ctx)
+    if not report["accounts"]:
+        print("\n  No hay cuentas OS registradas.")
+        return
+
+    for r in report["accounts"]:
+        issued = r["last_issued_at"].strftime("%d/%m/%Y %H:%M") if r["last_issued_at"] else "sin registro"
+        print(f"\n  {r['alias']}")
+        print(f"    Token emitido:        {issued}  (edad: {_fmt_hours(r['age_hours'])})")
+        if r["can_renew"]:
+            print("    Se renueva sola:      si")
+        else:
+            print("    Se renueva sola:      NO — falta stoken/ltmid_v2. Usa 'Reingresar contrasena'.")
+        print(f"    Canjes con token OK:  {r['ok_count']}  (edad maxima vista: {_fmt_hours(r['max_ok_age_hours'])})")
+        print(f"    Fallos por sesion:    {r['fail_count']}  (edad minima al fallar: {_fmt_hours(r['min_fail_age_hours'])})")
+
+    print(f"\n{SEP}")
+    safe = report["safe_interval_hours"]
+    if safe is not None:
+        print(f"  Un token ya vencio con {safe:.1f} h de edad.")
+        print(f"  NO dejes pasar {safe:.1f} h entre dos corridas de tareas diarias.")
+    elif report["max_ok_age_hours"] is not None:
+        print(f"  Un token todavia servia con {report['max_ok_age_hours']:.1f} h de edad.")
+        print("  Todavia no se vio ningun vencimiento: el limite real es mayor que eso.")
+    else:
+        print("  Todavia no hay canjes medidos. Los datos aparecen al canjear codigos.")
+    print(SEP)
+
+
 async def run() -> None:
     """Bucle principal de la aplicacion."""
     store = AccountStore(DB_PATH)
@@ -551,12 +594,15 @@ async def run() -> None:
         elif choice == "8":
             await _action_relogin(ctx)
 
+        elif choice == "9":
+            _action_token_report(ctx)
+
         elif choice == "0":
             print("\n  Hasta luego.\n")
             break
 
         else:
-            print("  Opcion no valida. Elige entre 0 y 8.")
+            print("  Opcion no valida. Elige entre 0 y 9.")
 
 
 def main() -> None:

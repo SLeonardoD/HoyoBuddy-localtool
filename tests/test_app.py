@@ -11,6 +11,7 @@ de queries/constraints es parte de lo que se prueba).
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
@@ -27,6 +28,8 @@ from app import (
     redeem_pending_codes,
     _process_mimo_tasks,
     _process_mimo_buys,
+    _redeem_with_token_refresh,
+    get_token_report,
 )
 import config
 from db.store import AccountStore, GiftCodeStore
@@ -78,11 +81,12 @@ def mock_manager(account_store: AccountStore) -> MagicMock:
     mock_active.region  = "os"
     mock_active.games   = [mock_game]
 
-    async def fake_login(email, password, *, region=None):
+    async def fake_login(email, password, *, region=None, force_fresh=False):
         account_store.set(email, region or "os", dict(TEST_COOKIES_OS), TEST_DEVICE_ID)
         return mock_active
 
     manager.login = AsyncMock(side_effect=fake_login)
+    manager.renew_cookie_token = AsyncMock(return_value=True)
     manager._mock_active = mock_active  # acceso directo para configurar la sesion en tests
     return manager
 
@@ -889,3 +893,506 @@ class TestProcessMimoBuys:
         assert len(result) == 1
         assert result[0]["success"] is False
         assert "Insufficient points" in result[0]["message"] or "-500" in result[0]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Relogin real y renovacion del cookie_token_v2
+# ---------------------------------------------------------------------------
+
+class TestReloginIsAFreshLogin:
+
+    @pytest.mark.asyncio
+    async def test_relogin_forces_a_real_login(self, ctx_with_account: AppContext) -> None:
+        """
+        REGLA CLAVE: "Reingresar contrasena" pide un login REAL
+        (force_fresh=True). Sin eso, si el ltoken seguia vivo el login
+        devolvia las cookies guardadas y la contrasena nunca se usaba.
+        """
+        ctx_with_account.manager._mock_active.session.get_game_accounts = AsyncMock(return_value=[])
+        await relogin_account(ctx_with_account, ALIAS_1, "new_password")
+
+        assert ctx_with_account.manager.login.call_args.kwargs["force_fresh"] is True
+
+    @pytest.mark.asyncio
+    async def test_add_account_does_not_force_fresh(self, ctx: AppContext) -> None:
+        """Agregar una cuenta si puede reutilizar una sesion guardada (soft-delete previo)."""
+        ctx.manager._mock_active.session.get_game_accounts = AsyncMock(return_value=[])
+        await add_account(ctx, ALIAS_1, EMAIL_1, "pass123")
+
+        assert ctx.manager.login.call_args.kwargs.get("force_fresh", False) is False
+
+
+def _os_account(**overrides) -> dict:
+    account = {
+        "alias": "A", "email": "a@x.com", "region": "os",
+        "cookies": {"ltuid_v2": "1", "cookie_token_v2": "STALE"}, "device_id": "dev-1",
+    }
+    account.update(overrides)
+    return account
+
+
+def _hoyo_error(retcode: int = -1071) -> HoyoAPIError:
+    return HoyoAPIError(retcode, "Please log in to your account first.", {})
+
+
+class TestRestoreSessionSharesCookies:
+
+    @pytest.mark.asyncio
+    async def test_session_uses_the_same_cookie_dict_as_the_account(self, ctx: AppContext) -> None:
+        """
+        La renovacion del token muta account["cookies"] in place y espera
+        que la sesion viva lo vea: restore_session() NO debe copiar el dict.
+        """
+        account = {"alias": ALIAS_1, "email": EMAIL_1, "region": "os",
+                   "cookies": dict(TEST_COOKIES_OS), "device_id": TEST_DEVICE_ID}
+
+        with patch("HoyoWrapper.session.HoyoSession.get_game_accounts", new=AsyncMock(return_value=[])):
+            active = await restore_session(ctx, account)
+
+        assert active.session.cookies is account["cookies"]
+
+
+class TestDailyTokenRenewal:
+
+    def _active_with_game(self) -> MagicMock:
+        game = MagicMock()
+        game.GAME_NAME = "Genshin Impact"
+        game.game_biz = "hk4e_global"
+        game.uid = "700000001"
+        game.claim_daily_reward = AsyncMock(return_value={
+            "message": "ok", "already_done": False, "total_sign_day": 1,
+        })
+        game.get_mimo_tasks = AsyncMock(side_effect=NotImplementedError)
+        game.buy_mimo_currency = AsyncMock(side_effect=NotImplementedError)
+        active = MagicMock(spec=ActiveSession)
+        active.games = [game]
+        return active
+
+    @pytest.mark.asyncio
+    async def test_os_account_token_is_renewed_every_daily_run(self, ctx: AppContext) -> None:
+        """
+        REGLA CLAVE: el token se renueva en CADA corrida diaria, aunque
+        ese dia no haya codigos — el token caduca y solo lo usa el canje.
+        """
+        _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+
+        with patch("app.restore_session", new=AsyncMock(return_value=self._active_with_game())):
+            with patch("app.random_delay", new=AsyncMock()):
+                await run_daily_tasks(ctx)
+
+        ctx.manager.renew_cookie_token.assert_awaited_once()
+        args = ctx.manager.renew_cookie_token.await_args.args
+        assert args[0] == EMAIL_1 and args[1] == "os"
+
+    @pytest.mark.asyncio
+    async def test_cn_account_is_never_renewed(self, ctx: AppContext) -> None:
+        _seed_account(ctx.account_store, "CN", "cn@x.com", "cn")
+
+        with patch("app.restore_session", new=AsyncMock(return_value=self._active_with_game())):
+            with patch("app.random_delay", new=AsyncMock()):
+                await run_daily_tasks(ctx)
+
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_renewal_happens_before_the_game_tasks(self, ctx: AppContext) -> None:
+        """Si el token se renovara DESPUES, un canje hecho en la misma corrida seguiria viendo el vencido."""
+        _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+        events: list[str] = []
+        active = self._active_with_game()
+
+        async def renew(*a, **kw):
+            events.append("renew")
+            return True
+
+        async def checkin(*a, **kw):
+            events.append("checkin")
+            return {"message": "ok", "already_done": False, "total_sign_day": 1}
+
+        ctx.manager.renew_cookie_token = AsyncMock(side_effect=renew)
+        active.games[0].claim_daily_reward = AsyncMock(side_effect=checkin)
+
+        with patch("app.restore_session", new=AsyncMock(return_value=active)):
+            with patch("app.random_delay", new=AsyncMock()):
+                await run_daily_tasks(ctx)
+
+        assert events == ["renew", "checkin"], f"Orden incorrecto: {events}"
+
+    @pytest.mark.asyncio
+    async def test_renewal_failure_is_a_warning_not_a_failure(self, ctx: AppContext) -> None:
+        """
+        Si no se puede renovar (ej. falta ltmid_v2), el check-in y demas
+        tareas igual se hacen — no dependen de ese token — y el usuario
+        recibe un aviso accionable en vez de enterarse dias despues
+        cuando un canje falle.
+        """
+        _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+        ctx.manager.renew_cookie_token = AsyncMock(return_value=False)
+
+        with patch("app.restore_session", new=AsyncMock(return_value=self._active_with_game())):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await run_daily_tasks(ctx)
+
+        acc = result["accounts"][0]
+        assert acc["success"] is True
+        assert any(t["type"] == "checkin" for t in acc["tasks"]), "El check-in no debe saltarse."
+        assert len(acc["warnings"]) == 1 and "Reingresar contrasena" in acc["warnings"][0]
+
+    @pytest.mark.asyncio
+    async def test_successful_renewal_leaves_no_warning(self, ctx: AppContext) -> None:
+        _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+
+        with patch("app.restore_session", new=AsyncMock(return_value=self._active_with_game())):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await run_daily_tasks(ctx)
+
+        assert result["accounts"][0]["warnings"] == []
+
+    @pytest.mark.asyncio
+    async def test_renewal_can_be_disabled_in_config(self, ctx: AppContext, monkeypatch) -> None:
+        monkeypatch.setattr(config, "RENEW_COOKIE_TOKEN_ON_DAILY_TASKS", False)
+        _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+
+        with patch("app.restore_session", new=AsyncMock(return_value=self._active_with_game())):
+            with patch("app.random_delay", new=AsyncMock()):
+                await run_daily_tasks(ctx)
+
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_renewal_when_session_is_expired(self, ctx: AppContext) -> None:
+        """Con la sesion base muerta no tiene sentido pedir un token: se reporta y se sigue."""
+        _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+
+        with patch("app.restore_session", new=AsyncMock(return_value=None)):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await run_daily_tasks(ctx)
+
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+        assert result["accounts"][0]["success"] is False
+
+
+class TestRedeemTokenRefresh:
+    """_redeem_with_token_refresh: UNA renovacion y UN reintento ante -1071, nunca mas."""
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_try_never_renews(self, ctx: AppContext) -> None:
+        game = MagicMock(redeem_code=AsyncMock(return_value=None))
+        await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        game.redeem_code.assert_awaited_once()
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_1071_renews_then_retries_once_and_succeeds(self, ctx: AppContext) -> None:
+        account = _os_account()
+        game = MagicMock(redeem_code=AsyncMock(side_effect=[_hoyo_error(), None]))
+        delays: list = []
+
+        async def fake_delay(min_s, max_s):
+            delays.append((min_s, max_s))
+
+        with patch("app.random_delay", side_effect=fake_delay):
+            await _redeem_with_token_refresh(ctx, account, game, "CODE")
+
+        assert game.redeem_code.await_count == 2
+        ctx.manager.renew_cookie_token.assert_awaited_once_with(
+            "a@x.com", "os", account["cookies"], "dev-1"
+        )
+        assert config.DELAY_TOKEN_REFRESH_TO_RETRY in delays, (
+            f"Debe haber una pausa antes del reintento. Delays: {delays}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_renewal_propagates_the_original_error_without_retry(self, ctx: AppContext) -> None:
+        ctx.manager.renew_cookie_token = AsyncMock(return_value=False)
+        game = MagicMock(redeem_code=AsyncMock(side_effect=_hoyo_error()))
+
+        with patch("app.random_delay", new=AsyncMock()):
+            with pytest.raises(HoyoAPIError) as exc:
+                await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        assert exc.value.retcode == -1071
+        assert game.redeem_code.await_count == 1, "Sin token renovado no tiene sentido reintentar."
+
+    @pytest.mark.asyncio
+    async def test_never_more_than_one_retry(self, ctx: AppContext) -> None:
+        """Si tras renovar sigue fallando, el error se propaga: nada de bucles contra el servidor."""
+        game = MagicMock(redeem_code=AsyncMock(side_effect=_hoyo_error()))
+
+        with patch("app.random_delay", new=AsyncMock()):
+            with pytest.raises(HoyoAPIError):
+                await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        assert game.redeem_code.await_count == 2
+        ctx.manager.renew_cookie_token.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_other_retcodes_never_trigger_a_renewal(self, ctx: AppContext) -> None:
+        """-2017 (ya reclamado) es un resultado del CODIGO, no de la sesion: no se renueva nada."""
+        game = MagicMock(redeem_code=AsyncMock(side_effect=_hoyo_error(-2017)))
+
+        with pytest.raises(HoyoAPIError) as exc:
+            await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        assert exc.value.retcode == -2017
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_account_already_renewed_this_run_is_not_renewed_again(self, ctx: AppContext) -> None:
+        """
+        Con varios codigos pendientes y una cuenta sin remedio, el
+        intento de renovar ocurre UNA vez por corrida y cuenta, no una
+        vez por cada codigo (eso seria martillar el endpoint de tokens).
+        """
+        account = _os_account(_token_renewed_this_run=True)
+        game = MagicMock(redeem_code=AsyncMock(side_effect=_hoyo_error()))
+
+        with pytest.raises(HoyoAPIError):
+            await _redeem_with_token_refresh(ctx, account, game, "CODE")
+
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+        assert game.redeem_code.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_manual_redeem_recovers_and_records_success(self, ctx: AppContext) -> None:
+        _seed_account(ctx.account_store, "Cuenta OS", "os1@x.com")
+        game = MagicMock(game_biz="hk4e_global", GAME_NAME="Genshin Impact", uid="1")
+        game.redeem_code = AsyncMock(side_effect=[_hoyo_error(), None])
+        active = MagicMock(spec=ActiveSession)
+        active.get_game = lambda biz: game
+
+        with patch("app.restore_session", new=AsyncMock(return_value=active)):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await redeem_code_for_all(ctx, "hk4e_global", "RECOVERED")
+
+        assert result[0]["success"] is True
+        ctx.manager.renew_cookie_token.assert_awaited_once()
+        code_id = ctx.code_store.get_or_create_code_id("hk4e_global", "RECOVERED")
+        assert ctx.code_store.has_redeemed(code_id, "Cuenta OS") is True
+
+    @pytest.mark.asyncio
+    async def test_auto_redeem_renews_once_for_several_codes(self, ctx: AppContext) -> None:
+        _seed_account(ctx.account_store, "Alice", "alice@x.com")
+        calls: list[str] = []
+
+        async def redeem(code, lang="en"):
+            calls.append(code)
+            if len(calls) == 1:
+                raise _hoyo_error()
+
+        game = MagicMock(game_biz="hk4e_global", GAME_NAME="Genshin Impact", uid="1")
+        game.redeem_code = redeem
+        active = MagicMock(spec=ActiveSession, games=[game])
+        for code in ("CODEONE", "CODETWO"):
+            await add_gift_code(ctx, "hk4e_global", code)
+
+        with patch("app.restore_session", new=AsyncMock(return_value=active)):
+            with patch("app.random_delay", new=AsyncMock()):
+                results = await redeem_pending_codes(ctx)
+
+        assert len(results) == 2 and all(r["success"] for r in results)
+        assert calls[0] == calls[1], f"El primer codigo debia reintentarse. Llamadas: {calls}"
+        assert len(calls) == 3
+        ctx.manager.renew_cookie_token.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unrecoverable_1071_stays_pending_and_tells_the_user_what_to_do(self, ctx: AppContext) -> None:
+        """
+        Si ni renovando sirve, el codigo NO se descarta (sigue pendiente:
+        el problema es la sesion, no el codigo) y el mensaje dice que hacer.
+        """
+        _seed_account(ctx.account_store, "Alice", "alice@x.com")
+        game = MagicMock(game_biz="hk4e_global", GAME_NAME="Genshin Impact", uid="1")
+        game.redeem_code = AsyncMock(side_effect=_hoyo_error())
+        active = MagicMock(spec=ActiveSession, games=[game])
+        await add_gift_code(ctx, "hk4e_global", "STILLGOOD")
+
+        with patch("app.restore_session", new=AsyncMock(return_value=active)):
+            with patch("app.random_delay", new=AsyncMock()):
+                results = await redeem_pending_codes(ctx)
+
+        assert results[0]["success"] is False
+        assert "Reingresar contrasena" in results[0]["message"]
+        assert len(ctx.code_store.get_pending_for_account("Alice", "hk4e_global")) == 1, (
+            "Un fallo de sesion no debe descartar el codigo ni marcarlo para esa cuenta."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Medicion de la vida util del cookie_token_v2
+#
+# Cada canje demuestra si el token servia y con cuantas horas de edad. Con
+# esos puntos, get_token_report() deduce el intervalo MAXIMO seguro entre
+# corridas de tareas diarias: el dato que ni genshin.py ni HoYoverse dan.
+# ---------------------------------------------------------------------------
+
+def _hours_ago(hours: float) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=hours)
+
+
+def _issued(ctx: AppContext, hours_ago: float, email: str = "a@x.com") -> None:
+    ctx.account_store.log_session_event(
+        email, "os", config.TOKEN_EVENT_ISSUED, created_at=_hours_ago(hours_ago)
+    )
+
+
+def _events(ctx: AppContext, event: str) -> list[dict]:
+    return ctx.account_store.list_session_events(event=event)
+
+
+class TestTokenUseMeasurement:
+
+    @pytest.mark.asyncio
+    async def test_a_working_redeem_records_ok_with_the_token_age(self, ctx: AppContext) -> None:
+        _issued(ctx, 5)
+        game = MagicMock(redeem_code=AsyncMock(return_value=None))
+
+        await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        (event,) = _events(ctx, config.TOKEN_EVENT_USE_OK)
+        assert event["age_hours"] == pytest.approx(5.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_a_code_level_error_still_proves_the_token_works(self, ctx: AppContext) -> None:
+        """
+        -2017 ("ya reclamado") lo responde el servidor DESPUES de aceptar la
+        sesion: el token servia. Contarlo como fallo falsearia la medicion.
+        """
+        _issued(ctx, 8)
+        game = MagicMock(redeem_code=AsyncMock(side_effect=_hoyo_error(-2017)))
+
+        with pytest.raises(HoyoAPIError):
+            await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        assert len(_events(ctx, config.TOKEN_EVENT_USE_OK)) == 1
+        assert _events(ctx, config.TOKEN_EVENT_USE_FAIL) == []
+
+    @pytest.mark.asyncio
+    async def test_a_session_failure_records_the_age_it_had_when_it_expired(self, ctx: AppContext) -> None:
+        """EL DATO CLAVE: 'el token ya habia vencido con 72 h de edad' => no hay que pasar de ahi."""
+        _issued(ctx, 72)
+        game = MagicMock(redeem_code=AsyncMock(side_effect=[_hoyo_error(), None]))
+
+        with patch("app.random_delay", new=AsyncMock()):
+            await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        (event,) = _events(ctx, config.TOKEN_EVENT_USE_FAIL)
+        assert event["age_hours"] == pytest.approx(72.0, abs=0.1)
+        assert _events(ctx, config.TOKEN_EVENT_USE_OK) == [], (
+            "El reintento tras renovar corre con un token de segundos de edad: no es un dato de vida util."
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_outcome_per_account_and_run_is_recorded(self, ctx: AppContext) -> None:
+        """Cinco codigos seguidos no deben llenar la tabla con cinco puntos casi identicos."""
+        _issued(ctx, 2)
+        account = _os_account()
+        game = MagicMock(redeem_code=AsyncMock(return_value=None))
+
+        for code in ("A", "B", "C"):
+            await _redeem_with_token_refresh(ctx, account, game, code)
+
+        assert len(_events(ctx, config.TOKEN_EVENT_USE_OK)) == 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_age_is_recorded_as_unknown(self, ctx: AppContext) -> None:
+        """Cuenta anterior a la medicion (sin evento de emision): se anota igual, con edad desconocida."""
+        game = MagicMock(redeem_code=AsyncMock(return_value=None))
+        await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        (event,) = _events(ctx, config.TOKEN_EVENT_USE_OK)
+        assert event["age_hours"] is None
+
+    @pytest.mark.asyncio
+    async def test_cn_accounts_are_not_measured(self, ctx: AppContext) -> None:
+        game = MagicMock(redeem_code=AsyncMock(return_value=None))
+        await _redeem_with_token_refresh(ctx, _os_account(region="cn"), game, "CODE")
+        assert ctx.account_store.list_session_events() == []
+
+    @pytest.mark.asyncio
+    async def test_a_measurement_failure_never_breaks_the_redeem(self, ctx: AppContext) -> None:
+        game = MagicMock(redeem_code=AsyncMock(return_value=None))
+        with patch.object(ctx.account_store, "log_session_event", side_effect=RuntimeError("disco lleno")):
+            await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")  # no debe lanzar
+
+        game.redeem_code.assert_awaited_once()
+
+
+class TestTokenReport:
+
+    @staticmethod
+    def _register(ctx: AppContext, alias: str, email: str, *, renewable: bool, region: str = "os") -> None:
+        cookies = {"ltuid_v2": "1", "ltoken_v2": "lt", "cookie_token_v2": "ct"}
+        if renewable:
+            cookies.update({"stoken": "st", "ltmid_v2": "mid"})
+        ctx.account_store.set(email, region, cookies, "dev")
+        ctx.account_store.set_alias(email, region, alias)
+
+    def test_no_accounts_gives_an_empty_report(self, ctx: AppContext) -> None:
+        assert get_token_report(ctx) == {
+            "accounts": [], "safe_interval_hours": None, "max_ok_age_hours": None,
+        }
+
+    def test_flags_accounts_that_cannot_renew_themselves(self, ctx: AppContext) -> None:
+        """Una cuenta registrada por login web (sin stoken) lo muestra: ahi hace falta 'Reingresar contrasena'."""
+        self._register(ctx, "vieja", "old@x.com", renewable=False)
+        self._register(ctx, "nueva", "new@x.com", renewable=True)
+
+        rows = {r["alias"]: r for r in get_token_report(ctx)["accounts"]}
+
+        assert rows["vieja"]["can_renew"] is False
+        assert rows["nueva"]["can_renew"] is True
+        assert rows["vieja"]["has_cookie_token"] is True
+
+    def test_cn_accounts_are_excluded(self, ctx: AppContext) -> None:
+        self._register(ctx, "china", "cn@x.com", renewable=True, region="cn")
+        assert get_token_report(ctx)["accounts"] == []
+
+    def test_summarizes_ok_and_failed_ages_per_account(self, ctx: AppContext) -> None:
+        self._register(ctx, "main", "a@x.com", renewable=True)
+        _issued(ctx, 3)
+        for age in (2.0, 20.0):
+            ctx.account_store.log_session_event("a@x.com", "os", config.TOKEN_EVENT_USE_OK, age_hours=age)
+        ctx.account_store.log_session_event("a@x.com", "os", config.TOKEN_EVENT_USE_FAIL, age_hours=70.0)
+
+        report = get_token_report(ctx)
+        (row,) = report["accounts"]
+
+        assert row["age_hours"] == pytest.approx(3.0, abs=0.1)
+        assert (row["ok_count"], row["fail_count"]) == (2, 1)
+        assert row["max_ok_age_hours"] == 20.0 and row["min_fail_age_hours"] == 70.0
+        assert report["max_ok_age_hours"] == 20.0 and report["safe_interval_hours"] == 70.0
+
+    def test_safe_interval_is_the_smallest_age_at_which_any_token_expired(self, ctx: AppContext) -> None:
+        """
+        El limite seguro lo marca el token que vencio MAS JOVEN, en cualquier
+        cuenta: si uno vencio a las 48 h, pasar de 48 h es arriesgado aunque
+        otro haya aguantado 70.
+        """
+        self._register(ctx, "uno", "a@x.com", renewable=True)
+        self._register(ctx, "dos", "b@x.com", renewable=True)
+        ctx.account_store.log_session_event("a@x.com", "os", config.TOKEN_EVENT_USE_FAIL, age_hours=70.0)
+        ctx.account_store.log_session_event("b@x.com", "os", config.TOKEN_EVENT_USE_FAIL, age_hours=48.0)
+
+        assert get_token_report(ctx)["safe_interval_hours"] == 48.0
+
+    def test_unknown_ages_do_not_pollute_the_summary(self, ctx: AppContext) -> None:
+        """Un fallo con edad desconocida existe (cuenta) pero no puede entrar en un minimo."""
+        self._register(ctx, "main", "a@x.com", renewable=True)
+        ctx.account_store.log_session_event("a@x.com", "os", config.TOKEN_EVENT_USE_FAIL, age_hours=None)
+
+        report = get_token_report(ctx)
+
+        assert report["safe_interval_hours"] is None
+        assert report["accounts"][0]["fail_count"] == 0
+
+    def test_no_failures_yet_means_no_safe_interval_claimed(self, ctx: AppContext) -> None:
+        """Sin ningun vencimiento observado NO se afirma un limite: solo cuanto aguanto como minimo."""
+        self._register(ctx, "main", "a@x.com", renewable=True)
+        ctx.account_store.log_session_event("a@x.com", "os", config.TOKEN_EVENT_USE_OK, age_hours=22.0)
+
+        report = get_token_report(ctx)
+
+        assert report["safe_interval_hours"] is None
+        assert report["max_ok_age_hours"] == 22.0

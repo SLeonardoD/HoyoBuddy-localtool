@@ -159,7 +159,10 @@ RSA_KEY_2 = (
 # =============================================================================
 
 DS_SALT_APP_LOGIN = "IZPgfb0dRPtBeLuFkdDznSZ6f4wWt6y2"   # getBySToken (redeem fix)
-DS_SALT_CN_SIGNIN = "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs"    # check-in diario CN
+# Corregido: antes tenia por error el salt de types.Region.CHINESE
+# ("xV8v4Qu5..."), que es OTRO salt. El de la clave "cn_signin" de
+# genshin.py (constants.py -> DS_SALT) es este.
+DS_SALT_CN_SIGNIN = "LyD1rXqMv2GJhnwdvCBjFOKGiKuLY3aO"    # check-in diario CN
 
 
 # =============================================================================
@@ -434,6 +437,16 @@ REDEEM_TRANSIENT_RETCODES: frozenset[int] = frozenset({
     -2014,  # codigo aun no activado (fecha futura)
 })
 
+# Retcodes de canje que NO hablan del codigo ni de la cuenta sino de la
+# SESION: "Please log in to your account first". El canje exige
+# cookie_token_v2 y ese token CADUCA (genshin.py lo renueva con
+# refresh_cookie_token "to make it last longer"). La solucion no es
+# marcar nada: es renovar el token con el stoken y reintentar UNA vez
+# (mismo patron que genshin.py usa en badge.py ante InvalidCookies).
+# No esta en ninguno de los 3 grupos de arriba a proposito: ni mata el
+# codigo, ni descarta a la cuenta.
+REDEEM_TOKEN_REFRESH_RETCODES: frozenset[int] = frozenset({-1071})
+
 
 # =============================================================================
 # Anti-deteccion — rangos de delay (segundos, min/max para random.uniform)
@@ -513,6 +526,10 @@ DELAY_LOGIN_TO_COOKIE_EXCHANGE: tuple[float, float] = (1.5, 3.5)
 # delay CERO justo despues de autenticar.
 DELAY_AFTER_LOGIN: tuple[float, float] = (2.0, 5.0)
 
+# Entre renovar el cookie_token_v2 (ante un -1071) y reintentar el canje
+# que acababa de fallar.
+DELAY_TOKEN_REFRESH_TO_RETRY: tuple[float, float] = (2.0, 5.0)
+
 # Entre canjes de codigo de regalo en cuentas distintas. HoYoverse aplica
 # su propio cooldown del lado del servidor para este endpoint en
 # particular — rango mas largo que el resto a proposito.
@@ -532,3 +549,86 @@ RETRY_WAIT_MULTIPLIER = 2
 RETRY_WAIT_MIN = 5
 RETRY_WAIT_MAX = 60
 RETRY_STOP_ATTEMPTS = 4
+
+
+# =============================================================================
+# Renovacion de sesion
+# =============================================================================
+
+# Renovar cookie_token_v2 en CADA corrida de tareas diarias (una request
+# por cuenta OS, con su delay humano), aunque ese dia no haya codigos
+# para canjear. El token caduca y el canje es lo unico que lo usa: si
+# solo se renovara cuando hace falta, el primer canje despues de varios
+# dias siempre fallaria. Poner en False para desactivarlo.
+RENEW_COOKIE_TOKEN_ON_DAILY_TASKS = True
+
+
+# =============================================================================
+# Login OS por app (es el que entrega el stoken)
+#
+# POR QUE EXISTE: el login web (webLoginByPassword) devuelve ltoken_v2,
+# cookie_token_v2, ltmid_v2, ltuid_v2, account_id_v2 y account_mid_v2 —
+# pero NO un stoken (genshin.py lo documenta en su modelo WebLoginResult).
+# El cookie_token_v2 caduca, y sin stoken no hay forma de renovarlo: habia
+# que volver a poner la contrasena. El login por app (appLoginByPassword,
+# genshin.py: login_with_app_password) si devuelve el stoken, que es la
+# credencial duradera: con stoken + ltmid_v2 se generan ltoken_v2 y
+# cookie_token_v2 nuevos cuando haga falta, sin contrasena ni captcha.
+# Fuente: genshin/client/components/auth/subclients/app.py y
+# genshin/utility/auth.py (APP_LOGIN_HEADERS).
+# =============================================================================
+
+# "app": login por app (da stoken, permite renovar sin contrasena).
+# "web": el login web de siempre (sin stoken; el token vence y hay que
+#        reingresar la contrasena). Es la salida de emergencia si HoYoverse
+#        cambia el flujo de app y deja de funcionar: basta con cambiar esto.
+OS_LOGIN_METHOD = "app"
+
+APP_LOGIN_URL = (
+    "https://sg-public-api.hoyoverse.com/account/ma-passport/api/appLoginByPassword"
+)
+
+# Cabeceras del cliente "app movil" de HoYoLab. A proposito distintas de
+# WEB_LOGIN_HEADERS: este endpoint espera client_type 2 y pide el captcha
+# en version 4 (x-rpc-aigis_v4). El x-rpc-device_id y la firma ds se
+# agregan en cada request (ver AuthManager._os_app_login_flow).
+APP_LOGIN_HEADERS: dict[str, str] = {
+    "x-rpc-app_id":      APP_ID_OS,
+    "x-rpc-client_type": "2",
+    "x-rpc-aigis_v4":    "true",
+    "x-rpc-app_version": "4.8.0",
+    "x-rpc-sdk_version": "2.2.0",
+    "Content-Type":      "application/json",
+}
+
+# Verificacion por email dentro del login por app (dispositivo nuevo):
+# usa client_type 2, no el 4 del flujo web.
+APP_EMAIL_SEND_HEADERS: dict[str, str] = {
+    "x-rpc-app_id":      APP_ID_OS,
+    "x-rpc-client_type": "2",
+    "Content-Type":      "application/json",
+}
+APP_EMAIL_VERIFY_HEADERS: dict[str, str] = {**APP_EMAIL_SEND_HEADERS}
+
+# Geetest v4 (captcha del login por app). Fuente: genshin.py server.py
+# (GT_V4_URL y HOYOLAB_GT_SERVER).
+GEETEST_V4_JS_URL = "https://static.geetest.com/v4/gt4.js"
+GEETEST_V4_API_SERVER_OS = "gcaptcha4.captchami.com"
+
+# Retcodes del login por app (genshin.py: app.py).
+APP_LOGIN_CAPTCHA_RETCODE = -3101       # pide captcha (Geetest v4 o v3, segun la respuesta)
+APP_LOGIN_EMAIL_VERIFY_RETCODE = -3239  # dispositivo nuevo: pide verificacion por email
+
+
+# =============================================================================
+# Medicion de la vida util del cookie_token_v2
+#
+# Nombres de los eventos que se guardan en la tabla session_events (ver
+# db/store.py). Permiten saber cuanto dura realmente un token — dato que
+# ni genshin.py ni HoYoverse documentan — y por lo tanto cual es el
+# intervalo MAXIMO seguro entre dos corridas de tareas diarias.
+# =============================================================================
+
+TOKEN_EVENT_ISSUED = "token_issued"        # se emitio un token (login o renovacion)
+TOKEN_EVENT_USE_OK = "token_use_ok"        # un canje demostro que el token servia
+TOKEN_EVENT_USE_FAIL = "token_use_fail"    # un canje fallo por sesion (-1071)

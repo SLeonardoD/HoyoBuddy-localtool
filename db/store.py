@@ -39,7 +39,7 @@ import typing
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Column, DateTime, ForeignKey, Integer, String, Text,
+    Column, DateTime, Float, ForeignKey, Index, Integer, String, Text,
     UniqueConstraint, create_engine, select,
 )
 from sqlalchemy.exc import IntegrityError
@@ -87,6 +87,39 @@ class _AccountRecord(_AccountsBase):
     device_id    = Column(String(36), nullable=False, default="")
     created_at   = Column(DateTime(timezone=True), nullable=False)
     updated_at   = Column(DateTime(timezone=True), nullable=False)
+
+
+class _SessionEventRecord(_AccountsBase):
+    """
+    Fila de la tabla session_events: historial de MEDICION de las
+    credenciales de sesion (cuando se emite un cookie_token_v2 y cuando se
+    usa, con su edad en horas).
+
+    Existe para responder una pregunta que ni genshin.py ni HoYoverse
+    documentan: cuanto dura un cookie_token_v2. Con esos datos se sabe
+    cual es el intervalo MAXIMO seguro entre dos corridas diarias.
+
+    event       'token_issued'    se emitio un token (login o renovacion).
+                                  age_hours = edad del token anterior.
+                'token_use_ok'    un canje demostro que el token servia.
+                'token_use_fail'  un canje fallo por sesion (-1071).
+                                  age_hours = edad del token al fallar:
+                                  es la medicion que importa.
+    age_hours   Horas desde el ultimo 'token_issued'; NULL si no hay
+                registro previo (cuentas anteriores a este historial).
+    """
+    __tablename__ = "session_events"
+    __table_args__ = (
+        Index("ix_session_events_lookup", "email", "region", "event"),
+    )
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    email      = Column(String(255), nullable=False)
+    region     = Column(String(8), nullable=False)
+    event      = Column(String(32), nullable=False)
+    age_hours  = Column(Float, nullable=True)
+    detail     = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), nullable=False)
 
 
 class AccountStore:
@@ -316,6 +349,98 @@ class AccountStore:
         return True
 
 
+    # ------------------------------------------------------------------
+    # Medicion de sesiones (historial de tokens)
+    # ------------------------------------------------------------------
+
+    def log_session_event(
+        self,
+        email: str,
+        region: str,
+        event: str,
+        *,
+        detail: str = "",
+        age_hours: typing.Optional[float] = None,
+        created_at: typing.Optional[datetime] = None,
+    ) -> None:
+        """
+        Registra un evento de medicion (ver _SessionEventRecord).
+        `created_at` solo se pasa para importar/probar datos historicos;
+        en uso normal es "ahora".
+        """
+        with self._factory() as db:
+            db.add(_SessionEventRecord(
+                email=email, region=region, event=event,
+                age_hours=age_hours, detail=detail,
+                created_at=created_at or datetime.now(timezone.utc),
+            ))
+            db.commit()
+
+    def last_session_event(
+        self, email: str, region: str, event: str,
+    ) -> typing.Optional[dict]:
+        """El evento mas reciente de ese tipo para (email, region), o None."""
+        with self._factory() as db:
+            record = db.execute(
+                select(_SessionEventRecord)
+                .where(
+                    _SessionEventRecord.email == email,
+                    _SessionEventRecord.region == region,
+                    _SessionEventRecord.event == event,
+                )
+                .order_by(_SessionEventRecord.created_at.desc(), _SessionEventRecord.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        return _event_to_dict(record) if record else None
+
+    def list_session_events(
+        self,
+        *,
+        email: typing.Optional[str] = None,
+        region: typing.Optional[str] = None,
+        event: typing.Optional[str] = None,
+    ) -> list[dict]:
+        """Eventos en orden cronologico, con filtros opcionales."""
+        with self._factory() as db:
+            stmt = select(_SessionEventRecord)
+            if email is not None:
+                stmt = stmt.where(_SessionEventRecord.email == email)
+            if region is not None:
+                stmt = stmt.where(_SessionEventRecord.region == region)
+            if event is not None:
+                stmt = stmt.where(_SessionEventRecord.event == event)
+            records = db.execute(
+                stmt.order_by(_SessionEventRecord.created_at, _SessionEventRecord.id)
+            ).scalars().all()
+        return [_event_to_dict(r) for r in records]
+
+    def hours_since_last_event(
+        self, email: str, region: str, event: str,
+    ) -> typing.Optional[float]:
+        """
+        Horas transcurridas desde el ultimo evento de ese tipo, o None si
+        nunca hubo uno. Centraliza la comparacion de fechas: SQLite
+        devuelve datetimes SIN zona horaria aunque se hayan guardado con
+        ella, y restar uno "aware" de uno "naive" lanza TypeError (el
+        mismo bug que ya hubo en get_pending_for_account).
+        """
+        last = self.last_session_event(email, region, event)
+        if last is None:
+            return None
+        then = last["created_at"]
+        if then.tzinfo is not None:
+            then = then.astimezone(timezone.utc).replace(tzinfo=None)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return max((now - then).total_seconds() / 3600.0, 0.0)
+
+
+def _event_to_dict(r: _SessionEventRecord) -> dict:
+    return {
+        "id": r.id, "email": r.email, "region": r.region, "event": r.event,
+        "age_hours": r.age_hours, "detail": r.detail, "created_at": r.created_at,
+    }
+
+
 def _record_to_dict(r: _AccountRecord) -> dict:
     return {
         "alias":      r.alias,
@@ -483,8 +608,19 @@ class GiftCodeStore:
         for r in records:
             if r.id in already_tried_ids:
                 continue
-            if r.expires_at is not None and r.expires_at <= now:
-                continue
+            if r.expires_at is not None:
+                # BUG CORREGIDO: SQLite no preserva timezone al guardar/leer
+                # DateTime(timezone=True) — el valor vuelve "naive" (sin
+                # tzinfo) aunque se haya guardado uno "aware", y comparar
+                # aware contra naive lanza TypeError. Normalizamos ambos
+                # lados a naive-UTC antes de comparar. Si en el futuro se
+                # migra a Postgres (que si preserva tzinfo), esta funcion
+                # sigue funcionando igual porque sigue normalizando.
+                expires_naive = r.expires_at.replace(tzinfo=None) \
+                    if r.expires_at.tzinfo else r.expires_at
+                now_naive = now.replace(tzinfo=None)
+                if expires_naive <= now_naive:
+                    continue
             pending.append({
                 "id": r.id, "code": r.code, "game_biz": r.game_biz,
                 "expires_at": r.expires_at,

@@ -869,3 +869,38 @@ class TestConfigConsistency:
             f"MIMO_FINISHABLE_TASK_TYPES no deberia incluir tipos que requieren "
             f"jugar de verdad. Overlap encontrado: {overlap}"
         )
+
+
+class TestRedeemSessionRetcodes:
+
+    def test_token_refresh_retcode_is_minus_1071(self) -> None:
+        """Ancla del retcode observado en vivo: 'Please log in to your account first'."""
+        assert -1071 in config.REDEEM_TOKEN_REFRESH_RETCODES
+
+    def test_token_refresh_retcodes_do_not_overlap_classification_groups(self) -> None:
+        """
+        Un retcode de "sesion sin permiso" no puede estar a la vez en un
+        grupo que marque el codigo como muerto o descarte a la cuenta:
+        ese error se arregla renovando el token, no marcando nada.
+        """
+        classified = (
+            config.REDEEM_GLOBAL_DEAD_RETCODES
+            | config.REDEEM_ACCOUNT_CLAIMED_RETCODES
+            | config.REDEEM_ACCOUNT_INELIGIBLE_RETCODES
+            | config.REDEEM_TRANSIENT_RETCODES
+        )
+        assert config.REDEEM_TOKEN_REFRESH_RETCODES.isdisjoint(classified), (
+            f"Solapamiento: {config.REDEEM_TOKEN_REFRESH_RETCODES & classified}"
+        )
+
+
+class TestCnSigninSalt:
+
+    def test_cn_signin_salt_is_not_the_region_chinese_salt(self) -> None:
+        """
+        REGRESION: DS_SALT_CN_SIGNIN tenia por error el salt de
+        types.Region.CHINESE de genshin.py (un salt DISTINTO). Anclas
+        verificadas leyendo constants.py de genshin.py instalado.
+        """
+        assert config.DS_SALT_CN_SIGNIN == "LyD1rXqMv2GJhnwdvCBjFOKGiKuLY3aO"
+        assert config.DS_SALT_CN_SIGNIN != "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs"

@@ -20,6 +20,7 @@ Logging exhaustivo via loguru:
 from __future__ import annotations
 
 import asyncio
+import random
 import typing
 import webbrowser
 
@@ -29,7 +30,10 @@ from loguru import logger
 
 import config
 
-__all__ = ["SessionMMT", "SessionMMTResult", "solve_geetest", "enter_code"]
+__all__ = [
+    "SessionMMT", "SessionMMTResult", "SessionMMTv4", "SessionMMTv4Result",
+    "solve_geetest", "solve_geetest_v4", "enter_code",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +54,26 @@ class SessionMMTResult(typing.TypedDict):
     geetest_challenge: str
     geetest_validate: str
     geetest_seccode: str
+    session_id: str
+
+
+class SessionMMTv4(typing.TypedDict):
+    """Datos del captcha Geetest v4 (login por app) devueltos por HoYoverse."""
+    captcha_id: str
+    risk_type: str
+    new_captcha: int
+    success: int
+    session_id: str
+
+
+class SessionMMTv4Result(typing.TypedDict):
+    """Resultado del captcha Geetest v4. El orden de los campos importa:
+    es el orden en que se serializan dentro del header x-rpc-aigis."""
+    captcha_id: str
+    lot_number: str
+    pass_token: str
+    gen_time: str
+    captcha_output: str
     session_id: str
 
 
@@ -345,3 +369,186 @@ async def enter_code(prompt: str = "Introduce el codigo de verificacion: ") -> s
     code = await asyncio.to_thread(input, prompt)
     logger.debug("[CAPTCHA] Codigo introducido (longitud={}).", len(code))
     return code
+
+
+# ===========================================================================
+# Geetest v4 (captcha del login por app)
+#
+# Servidor aparte del v3 a proposito: el v3 ya esta validado en vivo y no
+# se toca. Se porta el comportamiento de genshin.py (server.py) para v4:
+# initGeetest4 con captchaId/riskType/userInfo={session_id} y el servidor
+# de la app de HoYoLab (config.GEETEST_V4_API_SERVER_OS).
+# ===========================================================================
+
+_V4_RESULT_FIELDS = ("captcha_id", "lot_number", "pass_token", "gen_time", "captcha_output")
+
+_CAPTCHA_PAGE_V4 = """<!DOCTYPE html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="referrer" content="no-referrer"/>
+  <style>
+    body { font-family: sans-serif; display: flex; flex-direction: column;
+           align-items: center; justify-content: center; min-height: 100vh;
+           margin: 0; background: #1a1a2e; color: #eee; }
+    #status { margin-top: 20px; font-size: 14px; color: #aaa; }
+  </style>
+</head>
+<html>
+  <body>
+    <h2>HoYoverse &mdash; verificacion de seguridad</h2>
+    <p id="status">Cargando captcha...</p>
+  </body>
+  <script src="./gt/v4.js"></script>
+  <script>
+    const status = (t) => { document.getElementById("status").textContent = t; };
+    fetch("/mmt")
+      .then((r) => r.json())
+      .then((mmt) => {
+        initGeetest4({
+          captchaId: mmt.captcha_id,
+          riskType: mmt.risk_type,
+          userInfo: JSON.stringify({ session_id: mmt.session_id }),
+          apiServers: ["__API_SERVER__"],
+          product: "bind",
+          language: "__LANG__",
+        }, (captcha) => {
+          captcha.onReady(() => {
+            status("Resuelve el captcha para continuar.");
+            captcha.showCaptcha();
+          });
+          captcha.onSuccess(() => {
+            fetch("/send-data", {
+              method: "POST",
+              body: JSON.stringify({ session_id: mmt.session_id, ...captcha.getValidate() }),
+            });
+            status("Captcha resuelto. Puedes cerrar esta ventana.");
+          });
+          captcha.onError((err) => {
+            console.error("[Captcha v4] Error en el widget:", err);
+            status("Error en el captcha: " + JSON.stringify(err));
+          });
+        });
+      })
+      .catch((err) => {
+        console.error("[Captcha v4] Error cargando MMT:", err);
+        status("Error cargando el captcha.");
+      });
+  </script>
+</html>"""
+
+
+async def _launch_webapp_v4(
+    mmt: SessionMMTv4,
+    *,
+    lang: str = "en",
+    api_server: str = config.GEETEST_V4_API_SERVER_OS,
+    port: int = 5000,
+) -> SessionMMTv4Result:
+    """
+    Levanta un servidor local, abre el navegador y espera el resultado del
+    captcha Geetest v4. Devuelve SessionMMTv4Result.
+
+    A diferencia del v3, un resultado INCOMPLETO falla de inmediato
+    (RuntimeError) en vez de continuar con campos vacios: un aigis armado
+    con datos incompletos solo produce otro -3101 confuso del servidor.
+    Lanza RuntimeError tambien si se agota el tiempo (5 minutos).
+    """
+    logger.debug(
+        "[CAPTCHA-V4] Iniciando servidor local. puerto={} api_server={} lang={} "
+        "captcha_id={} risk_type={}",
+        port, api_server, lang, mmt.get("captcha_id"), mmt.get("risk_type"),
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[SessionMMTv4Result] = loop.create_future()
+    router = web.RouteTableDef()
+
+    @router.get("/")
+    async def index(request: web.Request) -> web.Response:
+        body = _CAPTCHA_PAGE_V4.replace("__API_SERVER__", api_server).replace("__LANG__", lang)
+        return web.Response(body=body.encode("utf-8"), content_type="text/html", charset="utf-8")
+
+    @router.get("/gt/v4.js")
+    async def gt_script(request: web.Request) -> web.Response:
+        """Sirve gt4.js desde el CDN de Geetest para evitar bloqueos CORS."""
+        try:
+            async with aiohttp.ClientSession() as http_session:
+                async with http_session.get(config.GEETEST_V4_JS_URL) as r:
+                    content = await r.read()
+            return web.Response(body=content, content_type="text/javascript")
+        except Exception as e:
+            logger.error("[CAPTCHA-V4] Error descargando gt4.js: {}", e)
+            return web.Response(status=500, text=f"Error descargando Geetest v4: {e}")
+
+    @router.get("/mmt")
+    async def mmt_endpoint(request: web.Request) -> web.Response:
+        return web.json_response(dict(mmt))
+
+    @router.post("/send-data")
+    async def send_data(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception as e:
+            logger.error("[CAPTCHA-V4] /send-data con cuerpo invalido: {}", e)
+            if not future.done():
+                future.set_exception(RuntimeError(f"Resultado de captcha v4 ilegible: {e}"))
+            return web.Response(status=400)
+
+        required = (*_V4_RESULT_FIELDS, "session_id")
+        missing = [f for f in required if not data.get(f)]
+        if missing:
+            logger.error("[CAPTCHA-V4] Resultado incompleto. Faltan: {}", missing)
+            if not future.done():
+                future.set_exception(
+                    RuntimeError(f"Resultado de captcha v4 incompleto, faltan: {missing}")
+                )
+            return web.Response(status=400)
+
+        if not future.done():
+            # Delay humano antes de devolver el resultado (igual que el v3).
+            delay = round(random.uniform(*config.DELAY_CAPTCHA_HUMAN), 2)
+            logger.debug("[CAPTCHA-V4] Aplicando delay humano de {}s...", delay)
+            await asyncio.sleep(delay)
+            future.set_result(SessionMMTv4Result(
+                captcha_id=data["captcha_id"],
+                lot_number=data["lot_number"],
+                pass_token=data["pass_token"],
+                gen_time=data["gen_time"],
+                captcha_output=data["captcha_output"],
+                session_id=data["session_id"],
+            ))
+            logger.info("[CAPTCHA-V4] Resultado aceptado.")
+        return web.Response(status=204)
+
+    app = web.Application()
+    app.add_routes(router)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="localhost", port=port)
+    await site.start()
+
+    logger.info("[CAPTCHA-V4] Servidor iniciado en http://localhost:{}. Abriendo navegador...", port)
+    webbrowser.open_new_tab(f"http://localhost:{port}")
+
+    try:
+        return await asyncio.wait_for(future, timeout=300)
+    except asyncio.TimeoutError:
+        logger.error("[CAPTCHA-V4] Timeout: el captcha no fue resuelto en 5 minutos.")
+        raise RuntimeError("El captcha no fue resuelto en 5 minutos. Intenta de nuevo.")
+    finally:
+        await asyncio.sleep(0.3)
+        await runner.shutdown()
+        await runner.cleanup()
+        logger.debug("[CAPTCHA-V4] Servidor apagado.")
+
+
+async def solve_geetest_v4(
+    mmt: SessionMMTv4,
+    *,
+    lang: str = "en",
+    api_server: str = config.GEETEST_V4_API_SERVER_OS,
+    port: int = 5000,
+) -> SessionMMTv4Result:
+    """Resuelve un captcha Geetest v4 abriendo el navegador del usuario."""
+    return await _launch_webapp_v4(mmt, lang=lang, api_server=api_server, port=port)
+

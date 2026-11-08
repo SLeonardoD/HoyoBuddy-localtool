@@ -16,7 +16,10 @@ No contiene logica de DB. CookieStore se recibe por inyeccion.
 
 from __future__ import annotations
 
+import base64
 import json
+import random
+import string
 import typing
 import uuid
 
@@ -26,7 +29,10 @@ from loguru import logger
 import config
 from HoyoWrapper import ds_utils
 from HoyoWrapper.timing import random_delay
-from HoyoWrapper.captcha_server import SessionMMT, SessionMMTResult, enter_code, solve_geetest
+from HoyoWrapper.captcha_server import (
+    SessionMMT, SessionMMTResult, SessionMMTv4, SessionMMTv4Result,
+    enter_code, solve_geetest, solve_geetest_v4,
+)
 from HoyoWrapper.session import HoyoAPIError, HoyoSession, LoginError
 
 __all__ = ["AuthManager"]
@@ -54,6 +60,12 @@ _EMAIL_VERIFY_HEADERS: dict[str, str] = {**_EMAIL_SEND_HEADERS}
 
 _CAPTCHA_RETCODES_OS = config.CAPTCHA_RETCODES_OS
 _CAPTCHA_RETCODES_CN = config.CAPTCHA_RETCODES_CN
+
+# Login OS por app (el que entrega el stoken, ver config.OS_LOGIN_METHOD).
+_APP_LOGIN_URL = config.APP_LOGIN_URL
+_APP_LOGIN_HEADERS: dict[str, str] = {**config.APP_LOGIN_HEADERS, "User-Agent": _USER_AGENT}
+_APP_EMAIL_SEND_HEADERS: dict[str, str] = {**config.APP_EMAIL_SEND_HEADERS, "User-Agent": _USER_AGENT}
+_APP_EMAIL_VERIFY_HEADERS: dict[str, str] = {**_APP_EMAIL_SEND_HEADERS}
 
 # Mensajes de errores de credenciales — usados para decidir si hacer fallback a CN
 _MESSAGES_FOR_FALLBACK: dict[int, str] = {
@@ -107,7 +119,8 @@ def _log_response(label: str, resp: dict) -> None:
     Filtra headers relevantes para no llenar el log de ruido.
     """
     relevant_headers = {
-        k: v for k, v in resp.get("headers", {}).items()
+        k: ("<oculto>" if "cookie" in k.lower() else v)
+        for k, v in resp.get("headers", {}).items()
         if any(kw in k.lower() for kw in (
             "aigis", "verify", "rpc", "content-type", "set-cookie"
         ))
@@ -118,7 +131,7 @@ def _log_response(label: str, resp: dict) -> None:
         label,
         resp.get("retcode"),
         resp.get("message", ""),
-        resp.get("data"),
+        _redact(resp.get("data")),
         list(resp.get("cookies", {}).keys()),
         relevant_headers,
     )
@@ -166,15 +179,28 @@ class AuthManager:
         password: str,
         *,
         region: typing.Optional[typing.Literal["os", "cn"]] = None,
+        force_fresh: bool = False,
     ) -> HoyoSession:
         """
         Autentica y devuelve HoyoSession lista para operar.
         Intenta cookies guardadas primero. Si no hay o expiraron, hace login.
-        """
-        logger.debug("[AUTH] login() iniciado para email={} region={}", email, region)
 
-        # 1. Intentar cookies guardadas
-        regions_to_try = [region] if region else ["os", "cn"]
+        force_fresh=True se salta las cookies guardadas y hace SIEMPRE un
+        login real con la contrasena. Es lo que necesita "Reingresar
+        contrasena": las cookies guardadas pueden pasar la validacion
+        (ltoken_v2 sigue vivo) y aun asi tener el cookie_token_v2 vencido
+        o ausente — sin esto, reingresar la contrasena no cambiaba nada.
+        """
+        logger.debug(
+            "[AUTH] login() iniciado para email={} region={} force_fresh={}",
+            email, region, force_fresh,
+        )
+
+        # 1. Intentar cookies guardadas (salvo que se pida login real)
+        if force_fresh:
+            regions_to_try: list = []
+        else:
+            regions_to_try = [region] if region else ["os", "cn"]
         for r in regions_to_try:
             cookies, device_id = self._store.get(email, r)
             if cookies:
@@ -186,42 +212,12 @@ class AuthManager:
                 if await self._validate_session(session):
                     logger.info("[AUTH] Sesion restaurada desde store ({}).", r)
 
-                    # Auto-reparacion: cuentas logueadas antes de que se
-                    # agregara el intercambio stoken -> cookie_token_v2
-                    # tendrian redeem_code roto (-1071) para siempre si no
-                    # se completa esto aca.
-                    if (
-                        r == "os"
-                        and cookies.get("stoken")
-                        and "cookie_token_v2" not in cookies
-                    ):
-                        if not cookies.get("ltmid_v2"):
-                            logger.warning(
-                                "[AUTH] Sesion sin cookie_token_v2 y sin "
-                                "ltmid_v2 — no se puede auto-reparar. "
-                                "redeem_code seguira fallando con -1071 "
-                                "para esta cuenta hasta un re-login manual "
-                                "(opcion 1 del menu)."
-                            )
-                        else:
-                            logger.info(
-                                "[AUTH] Sesion sin cookie_token_v2 (sesion "
-                                "previa al fix de redeem). Reparando..."
-                            )
-                            # ANTI-BANEO: pausa antes de la request de
-                            # intercambio, en vez de dispararla pegada al
-                            # login/restauracion.
-                            await random_delay(*config.DELAY_LOGIN_TO_COOKIE_EXCHANGE)
-                            extra = await self._fetch_cookie_token(cookies)
-                            if extra:
-                                cookies.update(extra)
-                                self._store.set(email, r, cookies, device_id)
-                                session = HoyoSession(cookies, r, device_id)
-                                logger.info(
-                                    "[AUTH] cookie_token_v2 reparado y "
-                                    "persistido."
-                                )
-
+                    # Cuentas sin cookie_token_v2 (logueadas antes del fix de
+                    # redeem) se reparan aca. Renovar el token ya existente
+                    # es otro caso: lo hacen las tareas diarias y el canje
+                    # (ver app.py), no el login interactivo.
+                    if r == "os" and "cookie_token_v2" not in cookies:
+                        await self.renew_cookie_token(email, r, cookies, device_id)
                     return session
                 logger.info(
                     "[AUTH] Cookies expiradas para region={}. "
@@ -231,11 +227,18 @@ class AuthManager:
                 logger.debug("[AUTH] Sin cookies en store para region={}.", r)
 
         # 2. Login con la API
+        # Si esta cuenta ya tuvo un dispositivo, se reutiliza: el login por
+        # app exige un device_id CONSISTENTE (genshin.py: si cambia, HoYoverse
+        # vuelve a pedir verificacion por email en cada login).
+        known_device_id = self._known_device_id(email, region)
+        login_extra = {"device_id": known_device_id} if known_device_id else {}
         detected: typing.Literal["os", "cn"] = region or "os"
         logger.debug("[AUTH] Intentando login directo. Region detectada: {}", detected)
 
         try:
-            cookies, device_id = await self._do_login(email, password, region=detected)
+            cookies, device_id = await self._do_login(
+                email, password, region=detected, **login_extra,
+            )
             final_region = detected
         except LoginError as e:
             # Solo hacer fallback a CN si:
@@ -265,6 +268,10 @@ class AuthManager:
         self._store.set(email, final_region, cookies, device_id)
         logger.info("[AUTH] Login exitoso. Region={} | Cookies={}", 
                     final_region, list(cookies.keys()))
+        if final_region == "os" and "cookie_token_v2" in cookies:
+            self._record_token_issued(
+                email, final_region, source=f"login_{config.OS_LOGIN_METHOD}"
+            )
 
         return HoyoSession(cookies, final_region, device_id)
 
@@ -282,11 +289,223 @@ class AuthManager:
         email: str,
         password: str,
         region: typing.Literal["os", "cn"],
+        device_id: typing.Optional[str] = None,
     ) -> tuple[dict[str, str], str]:
-        logger.debug("[AUTH] _do_login region={}", region)
+        logger.debug("[AUTH] _do_login region={} metodo_os={}", region, config.OS_LOGIN_METHOD)
         if region == "os":
-            return await self._os_login_flow(email, password)
+            if config.OS_LOGIN_METHOD == "web":
+                return await self._os_login_flow(email, password)
+            return await self._os_app_login_flow(email, password, device_id=device_id)
         return await self._cn_login_flow(email, password)
+
+    async def _os_app_login_flow(
+        self, email: str, password: str, *, device_id: typing.Optional[str] = None,
+    ) -> tuple[dict[str, str], str]:
+        """
+        Login OS por app (appLoginByPassword): el que entrega el STOKEN.
+
+        Replica genshin.py (subclients/app.py: login_with_app_password).
+        Con el stoken + el mid se generan ltoken_v2 y cookie_token_v2
+        cuando haga falta (renew_cookie_token), sin volver a pedir la
+        contrasena. Eso es lo que el login web no permite: no devuelve
+        stoken, asi que su cookie_token_v2 vence sin forma de renovarlo.
+
+        Orden (igual que genshin.py): login -> captcha (v4 o v3) ->
+        verificacion por email (dispositivo nuevo) -> resultado.
+        Despues del login se piden ltoken_v2 y cookie_token_v2 con el
+        stoken, para que la sesion quede completa desde el primer dia.
+        """
+        device_id = device_id or _generate_app_device_id()
+        logger.debug("[AUTH] _os_app_login_flow iniciado. device_id={}", device_id)
+
+        payload = {
+            "account":  _encrypt_credentials(email, 1),
+            "password": _encrypt_credentials(password, 1),
+        }
+        headers = {**_APP_LOGIN_HEADERS, "x-rpc-device_id": device_id}
+
+        resp = await self._app_login_post(payload, headers)
+        _log_response("APP login inicial", resp)
+
+        if resp["retcode"] == config.APP_LOGIN_CAPTCHA_RETCODE:
+            resp = await self._handle_captcha_app(resp, payload, headers)
+            _log_response("APP login post-captcha", resp)
+
+        if resp["retcode"] == config.APP_LOGIN_EMAIL_VERIFY_RETCODE:
+            resp = await self._handle_email_verification(resp, payload, headers, app=True)
+            _log_response("APP login post-email", resp)
+
+        if resp["retcode"] != 0:
+            logger.error(
+                "[AUTH] Login por app fallido: retcode={} message={!r}",
+                resp["retcode"], resp.get("message"),
+            )
+            _raise_login_error(resp["retcode"], resp.get("message", ""))
+
+        data = resp.get("data") or {}
+        stoken = (data.get("token") or {}).get("token")
+        user_info = data.get("user_info") or {}
+        aid, mid = user_info.get("aid"), user_info.get("mid")
+        if not (stoken and aid and mid):
+            logger.error(
+                "[AUTH] appLoginByPassword retcode=0 pero la respuesta no trae "
+                "token/aid/mid. data={}", _redact(data),
+            )
+            raise LoginError(
+                "El login por app no devolvio stoken/aid/mid. Si persiste, "
+                "pone OS_LOGIN_METHOD = \"web\" en config.py."
+            )
+
+        cookies = {
+            "stoken":         stoken,
+            "ltuid_v2":       str(aid),
+            "ltmid_v2":       mid,
+            "account_id_v2":  str(aid),
+            "account_mid_v2": mid,
+        }
+
+        # ANTI-BANEO: pausa entre el login y la request de los tokens.
+        await random_delay(*config.DELAY_LOGIN_TO_COOKIE_EXCHANGE)
+        extra = await self._fetch_cookie_token(cookies)
+        if not extra.get("cookie_token_v2") or not extra.get("ltoken_v2"):
+            raise LoginError(
+                "El login por app funciono, pero no se pudieron obtener "
+                "ltoken_v2 y cookie_token_v2 con el stoken (ver el log). "
+                "Reintenta; si persiste, pone OS_LOGIN_METHOD = \"web\" en config.py."
+            )
+        cookies.update(extra)
+        logger.info("[AUTH] Login por app OK. Cookies={}", sorted(cookies.keys()))
+        return cookies, device_id
+
+    async def _app_login_post(self, payload: dict, headers: dict) -> dict:
+        """POST a appLoginByPassword con la firma ds (incluye el body, se recalcula cada vez)."""
+        headers["ds"] = ds_utils.generate_app_login_ds(payload, config.DS_SALT_APP_LOGIN)
+        return await self._raw_post(_APP_LOGIN_URL, payload, headers)
+
+    async def _solve_app_captcha(self, resp: dict) -> str:
+        """
+        Resuelve el captcha que pidio una respuesta del flujo por app (v4 o
+        v3) y devuelve el valor para el header x-rpc-aigis.
+
+        IMPORTANTE: un captcha resuelto sirve para UNA sola request. Quien
+        lo reciba no debe reutilizarlo en otra: HoYoverse lo rechaza
+        (-3102 "Verification code failed" — 验证码 significa a la vez
+        "codigo de verificacion" y "captcha").
+        """
+        aigis = _parse_app_aigis(resp)
+        data = aigis["data"]
+
+        if aigis["use_v4"]:
+            logger.info("[AUTH] Captcha v4 (flujo por app). Abriendo navegador...")
+            result = await solve_geetest_v4(
+                SessionMMTv4(
+                    captcha_id=data.get("captcha_id") or data["gt"],
+                    risk_type=data.get("risk_type", ""),
+                    new_captcha=data.get("new_captcha", 1),
+                    success=data.get("success", 1),
+                    session_id=aigis["session_id"],
+                ),
+                lang=self._lang,
+                api_server=config.GEETEST_V4_API_SERVER_OS,
+                port=self._captcha_port,
+            )
+            return _build_aigis_header_v4(result)
+
+        logger.info("[AUTH] Captcha v3 (flujo por app). Abriendo navegador...")
+        result = await solve_geetest(
+            SessionMMT(
+                gt=data["gt"],
+                challenge=data["challenge"],
+                new_captcha=data.get("new_captcha", 1),
+                success=data.get("success", 1),
+                session_id=aigis["session_id"],
+            ),
+            lang=self._lang,
+            api_server=config.GEETEST_API_SERVER_OS,
+            port=self._captcha_port,
+        )
+        return _build_aigis_header(result, aigis["mmt_type"])
+
+    async def _handle_captcha_app(self, resp: dict, payload: dict, headers: dict) -> dict:
+        """Resuelve el captcha del login por app y reintenta el login UNA vez."""
+        headers["x-rpc-aigis"] = await self._solve_app_captcha(resp)
+        logger.debug("[AUTH] Reintentando login por app tras el captcha...")
+        return await self._app_login_post(payload, headers)
+
+    async def _send_verification_email_app(self, ticket: str) -> None:
+        """
+        Envia el codigo de verificacion por email en el modo app.
+
+        Replica genshin.py (subclients/app.py: _send_verification_email): las
+        cabeceras son SOLO app_id y client_type. No lleva el x-rpc-aigis del
+        login (ese captcha ya se consumio; reenviarlo produjo
+        "-3102 Verification code failed" en vivo) ni el x-rpc-device_id. Si
+        el propio endpoint pide un captcha (-3101) se resuelve uno NUEVO y se
+        reenvia, una sola vez.
+        """
+        headers = {**_APP_EMAIL_SEND_HEADERS}
+        payload = {"action_type": "verify_for_component", "action_ticket": ticket}
+
+        for attempt in (1, 2):
+            logger.debug(
+                "[AUTH] Enviando email de verificacion (app). ticket={} intento={}",
+                ticket, attempt,
+            )
+            resp = await self._raw_post(_SEND_VERIFICATION_URL, payload, headers)
+            _log_response("send_verification_email (app)", resp)
+
+            if resp["retcode"] == 0:
+                return
+            if resp["retcode"] == config.APP_LOGIN_CAPTCHA_RETCODE and attempt == 1:
+                headers["x-rpc-aigis"] = await self._solve_app_captcha(resp)
+                continue
+            break
+
+        logger.error(
+            "[AUTH] Error al enviar email (app): retcode={} message={!r}",
+            resp["retcode"], resp.get("message"),
+        )
+        raise LoginError(
+            f"No se pudo enviar el email de verificacion: "
+            f"[{resp['retcode']}] {resp.get('message', '')}"
+        )
+
+    # ------------------------------------------------------------------
+    # Medicion de la vida util del cookie_token_v2
+    # ------------------------------------------------------------------
+
+    def _known_device_id(self, email: str, region: typing.Optional[str]) -> typing.Optional[str]:
+        """device_id ya guardado para esta cuenta (de cualquier login previo), o None."""
+        for r in ([region] if region else ["os", "cn"]):
+            _, device_id = self._store.get(email, r)
+            if device_id:
+                return device_id
+        return None
+
+    def _record_token_issued(self, email: str, region: str, *, source: str) -> None:
+        """
+        Registra que se emitio un cookie_token_v2 (medicion). Guarda la edad
+        del token ANTERIOR para ver cada cuanto se renueva. Si el store no
+        soporta eventos, o algo falla, no hace nada: medir nunca debe
+        tumbar un login ni una renovacion.
+        """
+        log_event = getattr(self._store, "log_session_event", None)
+        if log_event is None:
+            return
+        try:
+            hours_since = getattr(self._store, "hours_since_last_event", None)
+            previous_age = hours_since(email, region, config.TOKEN_EVENT_ISSUED) if hours_since else None
+            log_event(
+                email, region, config.TOKEN_EVENT_ISSUED,
+                detail=f"source={source}", age_hours=previous_age,
+            )
+            logger.info(
+                "[MEDICION] cookie_token_v2 emitido para {} (fuente={}). "
+                "Edad del token anterior: {}.", email, source,
+                f"{previous_age:.1f} h" if previous_age is not None else "desconocida",
+            )
+        except Exception as e:  # noqa: BLE001 - la medicion jamas debe romper el flujo
+            logger.warning("[MEDICION] No se pudo registrar el evento: {}", e)
 
     async def _os_login_flow(
         self, email: str, password: str
@@ -330,6 +549,7 @@ class AuthManager:
             )
             _raise_login_error(resp["retcode"], resp.get("message", ""))
 
+        _log_cookie_lifetimes("login web OS", resp)
         cookies = resp["cookies"]
         logger.debug("[AUTH] Cookies OS recibidas: {}", list(cookies.keys()))
 
@@ -359,6 +579,53 @@ class AuthManager:
 
         logger.info("[AUTH] _os_login_flow completado. Cookies: {}", list(cookies.keys()))
         return cookies, device_id
+
+    async def renew_cookie_token(
+        self, email: str, region: str, cookies: dict, device_id: str,
+    ) -> bool:
+        """
+        Pide un cookie_token_v2 NUEVO con el stoken y lo guarda.
+        Devuelve True si se renovo, False si no se pudo (y por que queda
+        en el log). No lanza excepciones: renovar es un intento de
+        mantenimiento, nunca debe tumbar la operacion que lo disparo.
+
+        POR QUE EXISTE: el canje de codigos exige cookie_token_v2 y ese
+        token CADUCA. Antes solo se pedia cuando NO existia
+        ("cookie_token_v2" not in cookies), asi que uno vencido se
+        quedaba guardado para siempre y el canje fallaba con -1071
+        ("Please log in to your account first") aunque check-in y mimo
+        (que no lo usan) siguieran funcionando.
+
+        Muta `cookies` IN PLACE a proposito: restore_session() le pasa a
+        HoyoSession ese mismo dict, asi que la sesion viva y los juegos
+        que ya la tienen ven el token nuevo sin reconstruir nada.
+
+        Solo OS: CN no tiene este concepto (Miyoushe).
+        """
+        if region != "os":
+            return False
+
+        if not cookies.get("stoken") or not cookies.get("ltmid_v2"):
+            logger.warning(
+                "[AUTH] No se puede renovar cookie_token_v2 de {}: faltan "
+                "{} en las cookies guardadas. Hace falta un login real "
+                "('Reingresar contrasena').",
+                email,
+                " y ".join(k for k in ("stoken", "ltmid_v2") if not cookies.get(k)),
+            )
+            return False
+
+        # ANTI-BANEO: pausa antes de la request, nunca pegada a la anterior.
+        await random_delay(*config.DELAY_LOGIN_TO_COOKIE_EXCHANGE)
+        extra = await self._fetch_cookie_token(cookies)
+        if not extra:
+            return False
+
+        cookies.update(extra)
+        self._store.set(email, region, cookies, device_id)
+        logger.info("[AUTH] cookie_token_v2 renovado y guardado para {}.", email)
+        self._record_token_issued(email, region, source="renewal")
+        return True
 
     async def _fetch_cookie_token(
         self, cookies: dict[str, str]
@@ -452,6 +719,14 @@ class AuthManager:
             return {}
 
         tokens = (data.get("data") or {}).get("tokens", [])
+        for tok in tokens:
+            # Medicion: cualquier campo que acompane al token (vencimiento,
+            # ttl, etc.) queda en el log, sin el valor secreto del token.
+            logger.info(
+                "[MEDICION] getBySToken: token_type={} otros_campos={}",
+                tok.get("token_type"),
+                {k: v for k, v in tok.items() if k not in ("token", "token_type")},
+            )
         result: dict[str, str] = {}
         for tok in tokens:
             if tok.get("token_type") == 2:
@@ -707,7 +982,7 @@ class AuthManager:
     # ------------------------------------------------------------------
 
     async def _handle_email_verification(
-        self, resp: dict, payload: dict, headers: dict
+        self, resp: dict, payload: dict, headers: dict, *, app: bool = False,
     ) -> dict:
         """Gestiona el flujo de verificacion por email."""
         verify_raw = resp["headers"].get("x-rpc-verify", "")
@@ -743,7 +1018,12 @@ class AuthManager:
             raise LoginError(f"Estructura de verificacion de email inesperada: {e}")
 
         logger.info("[AUTH] Enviando email de verificacion...")
-        await self._send_verification_email(ticket_str, headers=headers)
+        if app:
+            await self._send_verification_email_app(ticket_str)
+        else:
+            await self._send_verification_email(
+                ticket_str, headers=headers, base_headers=None,
+            )
 
         code = await enter_code("Introduce el codigo de verificacion enviado a tu email: ")
         logger.debug("[AUTH] Codigo introducido por el usuario. Verificando...")
@@ -752,6 +1032,7 @@ class AuthManager:
             code=code,
             action_ticket=action_ticket["risk_ticket"],
             verify_ticket=ticket_str,
+            headers=_APP_EMAIL_VERIFY_HEADERS if app else None,
         )
         logger.info("[AUTH] Codigo de email verificado correctamente.")
 
@@ -759,13 +1040,19 @@ class AuthManager:
             "risk_ticket": action_ticket["risk_ticket"],
             "verify_str":  json.dumps(action_ticket["verify_str"]),
         })
-        logger.debug("[AUTH] Reintentando login OS tras verificacion email...")
+        logger.debug("[AUTH] Reintentando login OS tras verificacion email (app={})...", app)
+        if app:
+            # genshin.py reintenta con el ticket y SIN captcha: el del login ya
+            # se consumio y reenviarlo hace que HoYoverse rechace la request.
+            headers.pop("x-rpc-aigis", None)
+            return await self._app_login_post(payload, headers)
         return await self._raw_post(_WEB_LOGIN_URL, payload, headers)
 
     async def _send_verification_email(
-        self, ticket: str, *, headers: typing.Optional[dict] = None
+        self, ticket: str, *, headers: typing.Optional[dict] = None,
+        base_headers: typing.Optional[dict] = None,
     ) -> None:
-        send_headers = {**_EMAIL_SEND_HEADERS}
+        send_headers = {**(base_headers or _EMAIL_SEND_HEADERS)}
         if headers:
             for key in ("x-rpc-aigis", "x-rpc-device_id"):
                 if key in headers:
@@ -790,7 +1077,8 @@ class AuthManager:
             )
 
     async def _verify_email_code(
-        self, code: str, action_ticket: str, verify_ticket: str
+        self, code: str, action_ticket: str, verify_ticket: str,
+        headers: typing.Optional[dict] = None,
     ) -> None:
         logger.debug("[AUTH] Verificando codigo de email...")
         resp = await self._raw_post(
@@ -801,7 +1089,7 @@ class AuthManager:
                 "email_captcha": code,
                 "verify_method": 2,
             },
-            _EMAIL_VERIFY_HEADERS,
+            headers or _EMAIL_VERIFY_HEADERS,
         )
         _log_response("verify_email_code", resp)
 
@@ -834,6 +1122,11 @@ class AuthManager:
                     http_status = resp.status
                     body = await resp.json(content_type=None)
                     resp_cookies = {c.key: c.value for c in resp.cookies.values()}
+                    resp_cookie_lifetimes = {
+                        c.key: {"max-age": c["max-age"], "expires": c["expires"]}
+                        for c in resp.cookies.values()
+                        if c["max-age"] or c["expires"]
+                    }
                     resp_headers = dict(resp.headers)
 
             logger.debug(
@@ -848,6 +1141,7 @@ class AuthManager:
                 "data":    body.get("data"),
                 "headers": {k.lower(): v for k, v in resp_headers.items()},
                 "cookies": resp_cookies,
+                "cookie_lifetimes": resp_cookie_lifetimes,
             }
 
         except aiohttp.ClientResponseError as e:
@@ -920,3 +1214,102 @@ def _raise_login_error(retcode: int, message: str) -> typing.NoReturn:
     raise LoginError(
         config.LOGIN_ERROR_MESSAGES.get(retcode, f"Error de login [{retcode}]: {message}")
     )
+
+
+# ---------------------------------------------------------------------------
+# Login por app: utilidades
+# ---------------------------------------------------------------------------
+
+def _generate_app_device_id() -> str:
+    """
+    device_id del login por app: 16 caracteres alfanumericos en minuscula,
+    como genshin.py (generate_app_device_id). NO es un UUID. Se guarda y
+    se reutiliza en cada login de la misma cuenta.
+    """
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+
+
+def _parse_app_aigis(resp: dict) -> dict:
+    """
+    Lee el captcha que pide el login por app desde el header x-rpc-aigis.
+    Devuelve {session_id, data, use_v4, mmt_type}. Lanza LoginError si el
+    header falta o no tiene la forma esperada (nada de adivinar).
+    """
+    raw = (resp.get("headers") or {}).get("x-rpc-aigis", "")
+    if not raw:
+        raise LoginError(
+            "HoYoverse pidio un captcha en el login por app pero no envio "
+            "x-rpc-aigis. Revisa el error_log."
+        )
+    try:
+        aigis = json.loads(raw)
+        data = aigis.get("data")
+        if isinstance(data, str):
+            data = json.loads(data)
+    except (json.JSONDecodeError, AttributeError) as e:
+        raise LoginError(f"No se pudo leer el captcha del login por app: {e}") from e
+    if not isinstance(data, dict) or not data.get("gt"):
+        raise LoginError(
+            "El captcha del login por app no trae el campo 'gt' esperado. "
+            "Revisa el error_log."
+        )
+    return {
+        "session_id": aigis.get("session_id", ""),
+        "data":       data,
+        "use_v4":     bool(data.get("use_v4")),
+        "mmt_type":   aigis.get("mmt_type", 1),
+    }
+
+
+def _build_aigis_header_v4(result: SessionMMTv4Result) -> str:
+    """
+    x-rpc-aigis para un captcha v4: "session_id;base64(json(campos))".
+    Mismo formato que v3 (genshin.py: get_aigis_header), pero con los 5
+    campos de v4 y en este orden.
+    """
+    data = {
+        key: result[key]
+        for key in ("captcha_id", "lot_number", "pass_token", "gen_time", "captcha_output")
+    }
+    encoded = base64.b64encode(json.dumps(data).encode()).decode()
+    return f"{result['session_id']};{encoded}"
+
+
+_SECRET_KEY_WORDS = ("token", "password", "secret", "cookie")
+
+
+def _redact(obj: typing.Any, _depth: int = 0) -> typing.Any:
+    """
+    Copia de `obj` apta para logs: oculta el VALOR de cualquier campo de
+    texto cuyo nombre sugiera un secreto (token, stoken, password, cookie).
+    Hace falta porque el login por app devuelve el stoken en claro dentro de
+    `data`, y los logs se comparten para diagnosticar.
+    """
+    if _depth > 6:
+        return "<...>"
+    if isinstance(obj, dict):
+        return {
+            k: (f"<oculto len={len(v)}>"
+                if isinstance(v, str) and any(w in str(k).lower() for w in _SECRET_KEY_WORDS)
+                else _redact(v, _depth + 1))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact(v, _depth + 1) for v in obj]
+    return obj
+
+
+def _log_cookie_lifetimes(label: str, resp: dict) -> None:
+    """
+    Medicion: que vencimiento DECLARA el servidor para cada cookie (Max-Age
+    / Expires del Set-Cookie). Una cookie sin ninguno es "de sesion": no
+    declara cuanto dura, y solo la medicion en uso real lo dice.
+    """
+    lifetimes = resp.get("cookie_lifetimes") or {}
+    if lifetimes:
+        logger.info("[MEDICION] {}: vencimiento declarado -> {}", label, lifetimes)
+    else:
+        logger.info(
+            "[MEDICION] {}: ninguna cookie declara vencimiento (sin Max-Age/Expires).",
+            label,
+        )

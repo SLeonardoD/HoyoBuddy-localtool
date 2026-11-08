@@ -271,13 +271,20 @@ class MockAccountStore:
         self._data: dict[tuple[str, str], tuple[dict, str]] = {}
         self.calls: list[tuple[str, tuple]] = []
 
+    # El store real serializa a JSON: get() devuelve SIEMPRE un dict nuevo y
+    # set() no conserva una referencia al dict recibido. El mock hace lo
+    # mismo (copias), porque renew_cookie_token() muta el dict de cookies
+    # in place — con un mock que compartiera referencias, mutar cookies
+    # "ya guardadas" pasaria desapercibido y hasta contaminaria las
+    # constantes de test (TEST_COOKIES_*) entre tests.
     def get(self, email: str, region: str):
         self.calls.append(("get", (email, region)))
-        return self._data.get((email, region), (None, None))
+        cookies, device_id = self._data.get((email, region), (None, None))
+        return (dict(cookies) if cookies is not None else None), device_id
 
     def set(self, email: str, region: str, cookies: dict, device_id: str) -> None:
         self.calls.append(("set", (email, region)))
-        self._data[(email, region)] = (cookies, device_id)
+        self._data[(email, region)] = (dict(cookies), device_id)
 
     def delete(self, email: str) -> None:
         self.calls.append(("delete", (email,)))
@@ -287,7 +294,7 @@ class MockAccountStore:
 
     def seed(self, email: str, region: str, cookies: dict, device_id: str) -> None:
         """Precarga datos sin registrar la llamada en self.calls."""
-        self._data[(email, region)] = (cookies, device_id)
+        self._data[(email, region)] = (dict(cookies), device_id)
 
 
 @pytest.fixture

@@ -48,6 +48,7 @@ __all__ = [
     "redeem_code_for_all",
     "add_gift_code",
     "redeem_pending_codes",
+    "get_token_report",
     "REDEEMABLE_GAMES",
     "TaskResult",
     "AccountResult",
@@ -94,6 +95,7 @@ class AccountResult(typing.TypedDict):
     success: bool        # False si la sesion no pudo restaurarse
     message: str         # mensaje de error si success=False
     tasks:   list[TaskResult]
+    warnings: list[str]  # avisos que NO impiden las tareas (ej. token sin renovar)
 
 
 class DailyRunResult(typing.TypedDict):
@@ -196,10 +198,13 @@ async def relogin_account(ctx: AppContext, alias: str, password: str) -> dict:
 
     Flujo:
       1. Busca la cuenta por alias para obtener su email/region.
-      2. Llama a manager.login(email, password, region=region) — esto
-         hace un login por credenciales normal (con captcha si hace
-         falta) y AuthManager persiste las cookies nuevas en la MISMA
-         fila (el alias no se toca, set() nunca lo modifica).
+      2. Llama a manager.login(..., force_fresh=True): un login REAL por
+         credenciales (con captcha si hace falta), sin reutilizar las
+         cookies guardadas. Sin force_fresh, si el ltoken seguia vivo el
+         login devolvia las cookies viejas tal cual y "reingresar la
+         contrasena" no renovaba nada (ni el cookie_token_v2 vencido).
+         AuthManager persiste las cookies nuevas en la MISMA fila (el
+         alias no se toca, set() nunca lo modifica).
 
     Devuelve el mismo shape que add_account().
     """
@@ -215,7 +220,9 @@ async def relogin_account(ctx: AppContext, alias: str, password: str) -> dict:
     region = account["region"]
 
     try:
-        session = await ctx.manager.login(email, password, region=region)
+        session = await ctx.manager.login(
+            email, password, region=region, force_fresh=True,
+        )
     except LoginError as e:
         logger.exception("Error de relogin para '{}'.", alias)
         return {
@@ -330,6 +337,11 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
 
     Por cada cuenta:
       1. Restaurar sesion (si falla, se reporta y se continua con la siguiente).
+      1b. Renovar cookie_token_v2 (solo cuentas OS, ver
+         config.RENEW_COOKIE_TOKEN_ON_DAILY_TASKS): el token caduca y solo
+         lo usa el canje de codigos, asi que se renueva TODOS los dias
+         aunque ese dia no haya codigos. Si no se puede, queda un aviso
+         en el resultado de la cuenta (no detiene las demas tareas).
       2. Para cada juego:
          a. Check-in diario.
          b. Mimo: reclamar recompensas de tareas completadas (status=1).
@@ -367,6 +379,7 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
                     "Usa 'Reingresar contrasena' para renovarla."
                 ),
                 "tasks": [],
+                "warnings": [],
             })
             continue
 
@@ -381,8 +394,20 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
                 "success": True,
                 "message": "Sin juegos soportados vinculados a esta cuenta.",
                 "tasks":   [],
+                "warnings": [],
             })
             continue
+
+        # Renovar cookie_token_v2 ANTES de las tareas: asi el canje de
+        # codigos nunca se encuentra con un token vencido, aunque hoy no
+        # haya codigos que canjear (ver docstring). _renew_account_token
+        # ya incluye su propio delay humano antes de la request.
+        warnings: list[str] = []
+        if config.RENEW_COOKIE_TOKEN_ON_DAILY_TASKS:
+            warning = await _renew_account_token(ctx, account)
+            if warning:
+                logger.warning("  {}: {}", alias, warning)
+                warnings.append(warning)
 
         # ANTI-BANEO: pausa "recien cargo la pagina" antes de la primera
         # accion sobre esta cuenta. A diferencia del delay entre cuentas
@@ -397,6 +422,7 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
             "success": True,
             "message": "OK",
             "tasks":   task_results,
+            "warnings": warnings,
         })
 
     return {"accounts": results}
@@ -693,6 +719,172 @@ def _classify_redeem_error(e: HoyoAPIError) -> tuple[str, str]:
     return "transient", ""
 
 
+def _format_redeem_error(e: HoyoAPIError) -> str:
+    """Mensaje de un fallo de canje; agrega una pista si es un tema de sesion."""
+    msg = f"[{e.retcode}] {e.message}"
+    if e.retcode in config.REDEEM_TOKEN_REFRESH_RETCODES:
+        msg += " — la sesion de esta cuenta no tiene permiso de canje; usa 'Reingresar contrasena'."
+    return msg
+
+
+async def _renew_account_token(ctx: AppContext, account: dict) -> typing.Optional[str]:
+    """
+    Renueva el cookie_token_v2 de una cuenta OS. Devuelve None si se
+    renovo (o no aplica), o un aviso en texto si no se pudo.
+
+    Usa account["cookies"] — el MISMO dict que restore_session() le dio a
+    la HoyoSession viva — y AuthManager lo muta in place, asi que la sesion
+    y los juegos ya construidos ven el token nuevo. Deja una marca en el
+    dict de la cuenta para no volver a renovar mas de una vez por corrida
+    (los dicts salen frescos de list_all() en cada corrida, la marca no
+    persiste).
+    """
+    if account["region"] != "os":
+        return None
+
+    account["_token_renewed_this_run"] = True
+    renewed = await ctx.manager.renew_cookie_token(
+        account["email"], account["region"], account["cookies"], account["device_id"],
+    )
+    if renewed:
+        logger.info("[TOKEN] cookie_token_v2 renovado para '{}'.", account["alias"])
+        return None
+    return (
+        "No se pudo renovar el permiso de canje de codigos (cookie_token_v2). "
+        "Usa 'Reingresar contrasena' para renovarlo."
+    )
+
+
+def _record_token_use(ctx: AppContext, account: dict, *, ok: bool) -> None:
+    """
+    Medicion: anota si el cookie_token_v2 servia al canjear, junto con la
+    EDAD que tenia (horas desde que se emitio). Se registra una sola vez
+    por cuenta y corrida (el primer resultado del canje), para que cinco
+    codigos seguidos no llenen la tabla de puntos casi identicos.
+
+    Con estos datos, get_token_report() calcula el intervalo maximo seguro
+    entre corridas. Nunca lanza: medir no puede romper un canje.
+    """
+    if account["region"] != "os" or account.get("_token_use_logged"):
+        return
+    account["_token_use_logged"] = True
+    try:
+        store = ctx.account_store
+        age = store.hours_since_last_event(
+            account["email"], account["region"], config.TOKEN_EVENT_ISSUED
+        )
+        event = config.TOKEN_EVENT_USE_OK if ok else config.TOKEN_EVENT_USE_FAIL
+        store.log_session_event(
+            account["email"], account["region"], event, detail="redeem", age_hours=age,
+        )
+        logger.info(
+            "[MEDICION] '{}': cookie_token_v2 {} con {} de edad.",
+            account["alias"], "VALIDO" if ok else "VENCIDO/INVALIDO",
+            f"{age:.1f} h" if age is not None else "edad desconocida",
+        )
+    except Exception as e:  # noqa: BLE001 - la medicion jamas debe romper el canje
+        logger.warning("[MEDICION] No se pudo registrar el uso del token: {}", e)
+
+
+def get_token_report(ctx: AppContext) -> dict:
+    """
+    Reporte de la medicion de vida util del cookie_token_v2 (solo cuentas OS).
+
+    Devuelve:
+      accounts              una fila por cuenta (ver claves abajo)
+      safe_interval_hours   la MENOR edad con la que un token ya habia
+                            vencido en algun canje, o None si nunca se vio
+                            un vencimiento. Es el limite que NO hay que
+                            alcanzar entre dos corridas de tareas diarias.
+      max_ok_age_hours      la MAYOR edad con la que un token todavia servia.
+
+    Por cuenta: alias, can_renew (tiene stoken y ltmid_v2: se renueva sola),
+    has_cookie_token, last_issued_at, age_hours, ok_count, fail_count,
+    max_ok_age_hours, min_fail_age_hours.
+    """
+    store = ctx.account_store
+    rows: list[dict] = []
+
+    for acc in store.list_all():
+        if acc["region"] != "os":
+            continue
+        email, region, cookies = acc["email"], acc["region"], acc["cookies"]
+
+        def ages(event: str) -> list[float]:
+            return [
+                e["age_hours"]
+                for e in store.list_session_events(email=email, region=region, event=event)
+                if e["age_hours"] is not None
+            ]
+
+        ok_ages, fail_ages = ages(config.TOKEN_EVENT_USE_OK), ages(config.TOKEN_EVENT_USE_FAIL)
+        issued = store.last_session_event(email, region, config.TOKEN_EVENT_ISSUED)
+        rows.append({
+            "alias":              acc["alias"],
+            "can_renew":          bool(cookies.get("stoken") and cookies.get("ltmid_v2")),
+            "has_cookie_token":   "cookie_token_v2" in cookies,
+            "last_issued_at":     issued["created_at"] if issued else None,
+            "age_hours":          store.hours_since_last_event(email, region, config.TOKEN_EVENT_ISSUED),
+            "ok_count":           len(ok_ages),
+            "fail_count":         len(fail_ages),
+            "max_ok_age_hours":   max(ok_ages) if ok_ages else None,
+            "min_fail_age_hours": min(fail_ages) if fail_ages else None,
+        })
+
+    fails = [r["min_fail_age_hours"] for r in rows if r["min_fail_age_hours"] is not None]
+    oks = [r["max_ok_age_hours"] for r in rows if r["max_ok_age_hours"] is not None]
+    return {
+        "accounts":            rows,
+        "safe_interval_hours": min(fails) if fails else None,
+        "max_ok_age_hours":    max(oks) if oks else None,
+    }
+
+
+async def _redeem_with_token_refresh(
+    ctx: AppContext,
+    account: dict,
+    game,
+    code: str,
+    *,
+    lang: str = "en",
+) -> None:
+    """
+    game.redeem_code() con UNA renovacion de token ante un -1071.
+
+    Si el canje falla con un retcode de config.REDEEM_TOKEN_REFRESH_RETCODES
+    (sesion sin permiso de canje: el cookie_token_v2 vencio), renueva el
+    token y reintenta una sola vez. Cualquier otro error se propaga igual
+    que antes. Si la renovacion falla, o el reintento vuelve a fallar, se
+    propaga el error — nunca hay mas de un reintento ni mas de una
+    renovacion por cuenta y corrida (no se martillea al servidor).
+    """
+    try:
+        await game.redeem_code(code, lang=lang)
+        _record_token_use(ctx, account, ok=True)
+        return
+    except HoyoAPIError as first_error:
+        if first_error.retcode not in config.REDEEM_TOKEN_REFRESH_RETCODES:
+            # El servidor ACEPTO la sesion: respondio por el codigo (ej.
+            # -2017 "ya reclamado"), no por el token. Cuenta como token valido.
+            _record_token_use(ctx, account, ok=True)
+            raise
+        # Fallo de sesion: el dato mas valioso de la medicion — la edad que
+        # tenia el token cuando dejo de servir.
+        _record_token_use(ctx, account, ok=False)
+        if account.get("_token_renewed_this_run"):
+            raise
+        logger.warning(
+            "[REDEEM] '{}' devolvio {} — renovando cookie_token_v2 y "
+            "reintentando una vez.", account["alias"], first_error.retcode,
+        )
+        if await _renew_account_token(ctx, account) is not None:
+            raise
+
+    # ANTI-BANEO: pausa entre la renovacion y el reintento.
+    await random_delay(*config.DELAY_TOKEN_REFRESH_TO_RETRY)
+    await game.redeem_code(code, lang=lang)
+
+
 async def redeem_code_for_all(
     ctx: AppContext,
     game_biz: str,
@@ -776,7 +968,7 @@ async def redeem_code_for_all(
         )
 
         try:
-            await target_game.redeem_code(code, lang=lang)
+            await _redeem_with_token_refresh(ctx, account, target_game, code, lang=lang)
             logger.success(
                 "[REDEEM] Canjeado en '{}' ({} uid={}).",
                 alias, target_game.GAME_NAME, target_game.uid
@@ -809,7 +1001,7 @@ async def redeem_code_for_all(
                 e.retcode, e.message
             )
             scope, label = _classify_redeem_error(e)
-            msg = f"[{e.retcode}] {e.message}"
+            msg = _format_redeem_error(e)
             if scope == "global":
                 ctx.code_store.mark_dead(code_id, msg)
                 logger.warning(
@@ -922,7 +1114,7 @@ async def redeem_pending_codes(ctx: AppContext) -> list[RedeemResult]:
                     alias, game.GAME_NAME, code
                 )
                 try:
-                    await game.redeem_code(code)
+                    await _redeem_with_token_refresh(ctx, account, game, code)
                     logger.success(
                         "[REDEEM-AUTO] Canjeado: '{}' | {} | {}",
                         alias, game.GAME_NAME, code
@@ -939,7 +1131,7 @@ async def redeem_pending_codes(ctx: AppContext) -> list[RedeemResult]:
                     continue
                 except HoyoAPIError as e:
                     scope, label = _classify_redeem_error(e)
-                    msg = f"[{e.retcode}] {e.message}"
+                    msg = _format_redeem_error(e)
                     logger.warning(
                         "[REDEEM-AUTO] '{}' | {} | {} -> {} ({})",
                         alias, game.GAME_NAME, code, msg, scope

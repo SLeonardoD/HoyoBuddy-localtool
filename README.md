@@ -14,15 +14,16 @@ Automatización de tareas diarias en HoYoLab (check-in, Mimo Viajero, canje de c
 6. [Módulo por módulo](#módulo-por-módulo)
 7. [Base de datos](#base-de-datos)
 8. [Sistema de códigos de regalo](#sistema-de-códigos-de-regalo)
-9. [Seguridad anti-baneo](#seguridad-anti-baneo)
-10. [Regiones OS y CN](#regiones-os-y-cn)
-11. [`config.py` — valores que cambian con el tiempo](#configpy--valores-que-cambian-con-el-tiempo)
-12. [Instalación y uso](#instalación-y-uso)
-13. [Tests](#tests)
-14. [Limitaciones conocidas](#limitaciones-conocidas)
-15. [Mantenimiento futuro](#mantenimiento-futuro)
-16. [Roadmap](#roadmap)
-17. [Créditos y fuente de verdad](#créditos-y-fuente-de-verdad)
+9. [Sesiones y renovación del token](#sesiones-y-renovación-del-token)
+10. [Seguridad anti-baneo](#seguridad-anti-baneo)
+11. [Regiones OS y CN](#regiones-os-y-cn)
+12. [`config.py` — valores que cambian con el tiempo](#configpy--valores-que-cambian-con-el-tiempo)
+13. [Instalación y uso](#instalación-y-uso)
+14. [Tests](#tests)
+15. [Limitaciones conocidas](#limitaciones-conocidas)
+16. [Mantenimiento futuro](#mantenimiento-futuro)
+17. [Roadmap](#roadmap)
+18. [Créditos y fuente de verdad](#créditos-y-fuente-de-verdad)
 
 ---
 
@@ -59,7 +60,8 @@ Desde el menú de consola (`main.py`):
 5. **Canjear código de regalo (manual)** — el usuario elige el juego, pega un código, y se canjea en todas las cuentas OS que tengan ese juego.
 6. **Agregar código de regalo a la base de datos** — guarda un código para que el sistema automático lo recuerde y lo canjee en cualquier cuenta futura sin volver a pedirlo.
 7. **Canjear códigos pendientes (automático)** — revisa todos los códigos guardados en la base de datos y los canjea en todas las cuentas/juegos que corresponda y que todavía no lo hayan intentado.
-8. **Reingresar contraseña** — para una cuenta cuya sesión expiró, sin tener que volver a escribir el email (ya se conoce).
+8. **Reingresar contraseña** — un login real (sin reutilizar las cookies guardadas) para una cuenta que no se puede renovar sola, sin volver a escribir el email (ya se conoce).
+9. **Ver medición de sesiones** — cuánto vive el token de canje y cuál es el intervalo máximo seguro entre corridas (ver [Sesiones y renovación del token](#sesiones-y-renovación-del-token)).
 
 ## Arquitectura
 
@@ -130,6 +132,9 @@ proyecto/
     ├── test_session.py
     ├── test_session_manager.py
     ├── test_auth_manager.py
+    ├── test_auth_app_login.py   Login por app, captcha v4/v3, medición
+    ├── test_captcha_server.py
+    ├── test_ds_utils.py
     ├── test_game_model.py
     └── test_app.py
 ```
@@ -154,7 +159,7 @@ El cerebro de la aplicación. Cada acción del menú tiene una función correspo
 La pieza más pequeña y más fundamental. `HoyoSession` guarda las cookies, la región (`os`/`cn`) y el `device_id` de una sesión autenticada, y expone `request()`: hace la petición HTTP con `aiohttp`, revisa el `retcode` de la respuesta, y lanza `HoyoAPIError` si no es `0`. Todo lo demás en el proyecto que habla con HoYoverse pasa, en algún punto, por este método.
 
 ### `HoyoWrapper/auth_manager.py`
-Toda la lógica de login: OS (HoYoLab) y CN (Miyoushe), resolución de captcha Geetest, verificación de email, y — el más sutil de todos — el intercambio `stoken` → `cookie_token_v2` (`_fetch_cookie_token()`), necesario porque el canje de códigos exige una cookie que el login normal no entrega (ver el [incidente documentado](#configpy--valores-que-cambian-con-el-tiempo)). También hace fallback automático de OS a CN, pero **solo** cuando el fallo es de credenciales, nunca cuando es de captcha (un captcha ya implica que HoYoLab reconoció el email, y además `miyoushe.com` no es alcanzable de forma confiable fuera de China).
+Toda la lógica de login y de renovación de sesión. Para OS hay dos métodos, elegibles con `config.OS_LOGIN_METHOD`: el **login por app** (por defecto; devuelve el `stoken`) y el **login web** (el original; no lo devuelve). Resuelve captcha Geetest (v4 y v3) y la verificación por email de dispositivo nuevo. `renew_cookie_token()` pide un `cookie_token_v2` nuevo con el `stoken` guardado, sin contraseña. También hace fallback automático de OS a CN, pero **solo** cuando el fallo es de credenciales, nunca cuando es de captcha (un captcha ya implica que HoYoLab reconoció el email, y además `miyoushe.com` no es alcanzable de forma confiable fuera de China). Los logs nunca contienen tokens ni valores de cookies (`_redact`): se comparten para diagnosticar.
 
 ### `HoyoWrapper/captcha_server.py`
 Levanta un servidor HTTP local temporal, abre el navegador del usuario, sirve el widget Geetest v3, y espera a que se resuelva (automáticamente, en modo silencioso) antes de devolver el resultado al flujo de login. Incluye un delay humano antes de enviar el resultado resuelto.
@@ -190,6 +195,10 @@ Dos particularidades de diseño importantes:
 
 Ver la sección siguiente, dedicada por completo a esto.
 
+### `session_events` — medición de sesiones
+
+Tercera tabla del mismo archivo, gestionada por `AccountStore`: un registro por cada emisión de token y por cada canje que demuestra si el token servía (con su edad en horas). Es solo medición: ningún flujo depende de ella, y si registrar un evento falla, el login o el canje siguen igual. Se conserva aunque se elimine la cuenta, porque el historial de vida útil sigue siendo útil. Ver [Sesiones y renovación del token](#sesiones-y-renovación-del-token).
+
 ## Sistema de códigos de regalo
 
 Dos tablas, `gift_codes` y `code_redemptions`, diseñadas para resolver un problema concreto: **no todos los fallos de canje significan lo mismo.**
@@ -206,6 +215,37 @@ Cuando un canje falla, el retcode de HoYoverse se clasifica en una de tres categ
 | **Transitorio** | Temporal (cooldown, código aún no activado, error de red, o un retcode que no reconocemos todavía) | No se guarda nada. La próxima corrida lo vuelve a intentar automáticamente — la ausencia de registro *es* el mecanismo de reintento. |
 
 El canje manual (opción 5 del menú) y el automático (opción 7) comparten toda esta lógica: un canje manual exitoso también queda registrado en `GiftCodeStore`, así que otras cuentas lo aprovechan automáticamente en la próxima corrida del sistema automático, sin que el usuario tenga que repetir el código a mano en cada una.
+
+## Sesiones y renovación del token
+
+El canje de códigos exige una cookie, `cookie_token_v2`, que **caduca**. Check-in y Mimo no la usan, así que pueden funcionar perfecto mientras el canje falla con `retcode -1071` ("Please log in to your account first").
+
+**Por qué había que reingresar la contraseña cada tanto.** El login web devuelve ese token pero no un `stoken` (la credencial duradera; según el propio modelo `WebLoginResult` de `genshin.py`). Sin `stoken` no hay forma de renovarlo: cuando vence, solo queda volver a loguearse.
+
+**Cómo se resuelve ahora.** Al registrar una cuenta OS se hace el *login por app* (`appLoginByPassword`), que sí devuelve el `stoken`. Se guarda, y con él (más el `mid`) se generan `ltoken_v2` y `cookie_token_v2` cuando hacen falta. La contraseña se usa una vez.
+
+| Cuándo | Qué pasa |
+|---|---|
+| Cada corrida de tareas diarias (opción 4) | Se renueva el token de cada cuenta OS, aunque ese día no haya códigos. Se desactiva con `RENEW_COOKIE_TOKEN_ON_DAILY_TASKS = False`. |
+| Un canje devuelve `-1071` | Se renueva el token y se reintenta **una sola vez**. Nunca más de una renovación por cuenta y corrida. |
+| La renovación no es posible | Aparece un aviso `[!]` en el resumen: falta `stoken`/`ltmid_v2` (cuentas registradas antes con login web). Se arregla con la opción 8, que ahora hace un login real. |
+
+**La contraseña solo vuelve a hacer falta** para cuentas registradas con el login web antiguo, o si el propio `stoken` deja de servir (caso excepcional; el aviso lo señala). Reingresarla puede abrir el captcha y, si HoYoverse lo considera un dispositivo nuevo, pedir un código por email. El `device_id` se conserva entre logins de la misma cuenta justamente para evitarlo.
+
+### Medición de la vida útil del token
+
+Ni HoYoverse ni `genshin.py` documentan cuánto dura un `cookie_token_v2`, así que el proyecto lo mide. Se guarda un evento en la tabla `session_events` cada vez que:
+
+- se **emite** un token (login o renovación), junto con la edad que tenía el anterior;
+- un **canje** demuestra que el token servía, o que ya había vencido, con la edad exacta que tenía en ese momento (se registra el primer resultado por cuenta y corrida).
+
+Además, el log registra (`[MEDICION]`) el vencimiento que el servidor declara en sus respuestas (`Max-Age`/`Expires`, y cualquier campo extra de `getBySToken`), sin el valor secreto.
+
+La opción 9 del menú resume todo: edad actual de cada token, si la cuenta se renueva sola, y el dato importante — *"un token ya venció con X h de edad: no dejes pasar X h entre dos corridas de tareas diarias"*. Mientras no se observe ningún vencimiento, no afirma ningún límite: solo informa cuánto aguantó como mínimo.
+
+### Volver al login web
+
+Si el login por app deja de funcionar (HoYoverse cambia algo), basta con poner `OS_LOGIN_METHOD = "web"` en `config.py`. Las cuentas registradas así funcionan igual que antes, pero sin renovación automática.
 
 ## Seguridad anti-baneo
 
@@ -262,7 +302,7 @@ El programa crea/usa un archivo SQLite (por defecto `./hoyo_auth.db`, configurab
 pytest
 ```
 
-~194 tests, todos ejecutables en aproximadamente 1 segundo (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
+313 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
 
 1. Un test verifica una regla de negocio, no un detalle de implementación.
 2. Los mensajes de assert explican qué se esperaba, qué se obtuvo, y por qué importa.
@@ -279,6 +319,8 @@ Estos principios están pensados para trasladarse a cualquier herramienta futura
 - **Honkai Impact 3rd**: check-in soportado; sin Mimo Viajero ni canje de códigos vía API (HoYoverse no los expone para este juego).
 - **Región CN**: sin Mimo Viajero ni canje de códigos (ver [Regiones OS y CN](#regiones-os-y-cn)). El check-in CN sí funciona, incluyendo la firma `ds` correspondiente.
 - **Tears of Themis**: no implementado todavía (ver [Roadmap](#roadmap)).
+- **Login por app sin validar en vivo todavía**: está portado de `genshin.py` y probado de punta a punta contra HoYoverse *simulado* (cifrado, firma, captcha v4/v3, verificación por email, persistencia), pero no contra el servidor real. Si falla, `OS_LOGIN_METHOD = "web"` vuelve al comportamiento anterior.
+- **Vida útil de `cookie_token_v2` y del `stoken`**: desconocida hasta que la medición acumule datos (opción 9).
 - **Remote config**: los valores de `config.py` están hardcodeados en el código fuente. La idea original era sincronizarlos desde un backend remoto (Supabase) para poder corregir un cambio de HoYoverse sin tocar el código instalado — no implementado en este MVP de consola.
 
 ## Mantenimiento futuro

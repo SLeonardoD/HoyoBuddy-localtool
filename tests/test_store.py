@@ -458,3 +458,103 @@ class TestGiftCodeStorePendingLogic:
         id1 = code_store.get_or_create_code_id("hk4e_global", "MANUALCODE")
         id2 = code_store.get_or_create_code_id("hk4e_global", "manualcode")
         assert id1 == id2, "get_or_create_code_id deberia devolver el mismo id para el mismo codigo normalizado."
+
+
+# =============================================================================
+# Medicion de sesiones (session_events)
+#
+# Responde: cuanto dura un cookie_token_v2? Ni genshin.py ni HoYoverse lo
+# documentan. Si algun dia un canje falla por sesion, el evento
+# 'token_use_fail' guarda la edad exacta del token: ese numero es el
+# intervalo maximo que NO se debe exceder entre dos corridas.
+# =============================================================================
+
+class TestSessionEvents:
+
+    def test_log_and_read_back_all_fields(self, account_store: AccountStore) -> None:
+        account_store.log_session_event(
+            TEST_EMAIL, "os", "token_issued", detail="renovacion", age_hours=23.5,
+        )
+        last = account_store.last_session_event(TEST_EMAIL, "os", "token_issued")
+
+        assert last["detail"] == "renovacion"
+        assert last["age_hours"] == 23.5
+        assert last["email"] == TEST_EMAIL and last["region"] == "os"
+
+    def test_last_returns_the_most_recent_of_that_type(self, account_store: AccountStore) -> None:
+        old = datetime.now(timezone.utc) - timedelta(hours=10)
+        account_store.log_session_event(TEST_EMAIL, "os", "token_issued", detail="viejo", created_at=old)
+        account_store.log_session_event(TEST_EMAIL, "os", "token_issued", detail="nuevo")
+
+        assert account_store.last_session_event(TEST_EMAIL, "os", "token_issued")["detail"] == "nuevo"
+
+    def test_events_are_independent_per_email_region_and_type(self, account_store: AccountStore) -> None:
+        account_store.log_session_event(TEST_EMAIL, "os", "token_issued")
+
+        assert account_store.last_session_event(OTHER_EMAIL, "os", "token_issued") is None
+        assert account_store.last_session_event(TEST_EMAIL, "cn", "token_issued") is None
+        assert account_store.last_session_event(TEST_EMAIL, "os", "token_use_fail") is None
+
+    def test_last_returns_none_without_events(self, account_store: AccountStore) -> None:
+        assert account_store.last_session_event(TEST_EMAIL, "os", "token_issued") is None
+
+    def test_hours_since_last_event_measures_elapsed_time(self, account_store: AccountStore) -> None:
+        five_hours_ago = datetime.now(timezone.utc) - timedelta(hours=5)
+        account_store.log_session_event(TEST_EMAIL, "os", "token_issued", created_at=five_hours_ago)
+
+        hours = account_store.hours_since_last_event(TEST_EMAIL, "os", "token_issued")
+        assert hours == pytest.approx(5.0, abs=0.01), f"Se esperaban ~5h, se obtuvo {hours}"
+
+    def test_hours_since_last_event_is_none_without_events(self, account_store: AccountStore) -> None:
+        assert account_store.hours_since_last_event(TEST_EMAIL, "os", "token_issued") is None
+
+    def test_hours_since_works_with_timezone_aware_and_naive_values(self, account_store_file: AccountStore) -> None:
+        """
+        REGRESION (mismo origen que el bug de get_pending_for_account):
+        SQLite devuelve datetimes sin zona horaria; restarlos de "ahora con
+        zona" lanza TypeError. Se prueba contra un archivo real, que es
+        donde ocurre el round-trip.
+        """
+        aware = datetime.now(timezone.utc) - timedelta(hours=2)
+        account_store_file.log_session_event(TEST_EMAIL, "os", "token_issued", created_at=aware)
+
+        hours = account_store_file.hours_since_last_event(TEST_EMAIL, "os", "token_issued")
+        assert hours == pytest.approx(2.0, abs=0.01)
+
+    def test_list_is_chronological_and_filterable(self, account_store: AccountStore) -> None:
+        base = datetime.now(timezone.utc)
+        account_store.log_session_event(TEST_EMAIL, "os", "token_use_ok", detail="3", created_at=base)
+        account_store.log_session_event(TEST_EMAIL, "os", "token_issued", detail="1", created_at=base - timedelta(hours=2))
+        account_store.log_session_event(OTHER_EMAIL, "os", "token_issued", detail="x", created_at=base - timedelta(hours=1))
+
+        mine = account_store.list_session_events(email=TEST_EMAIL)
+        assert [e["detail"] for e in mine] == ["1", "3"], "Debe estar en orden cronologico."
+        assert len(account_store.list_session_events(event="token_issued")) == 2
+        assert len(account_store.list_session_events()) == 3
+
+    def test_existing_database_gets_the_new_table_without_manual_migration(self, tmp_path) -> None:
+        """
+        Una base creada ANTES de este historial (solo tabla accounts) debe
+        seguir funcionando: la tabla nueva se crea sola al abrirla y las
+        cuentas existentes siguen legibles.
+        """
+        db_path = str(tmp_path / "legacy.db")
+        con = sqlite3.connect(db_path)
+        con.execute(
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, alias VARCHAR(64), "
+            "email VARCHAR(255) NOT NULL, region VARCHAR(8) NOT NULL, cookies_json TEXT NOT NULL, "
+            "device_id VARCHAR(36) NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+            "UNIQUE (email, region), UNIQUE (alias))"
+        )
+        con.execute(
+            "INSERT INTO accounts (alias, email, region, cookies_json, device_id, created_at, updated_at) "
+            "VALUES ('Vieja', 'old@x.com', 'os', '{\"ltuid_v2\": \"1\"}', 'dev', '2026-01-01', '2026-01-01')"
+        )
+        con.commit()
+        con.close()
+
+        store = AccountStore(db_path)
+
+        assert [a["alias"] for a in store.list_all()] == ["Vieja"], "Las cuentas existentes deben seguir ahi."
+        store.log_session_event("old@x.com", "os", "token_issued")
+        assert store.last_session_event("old@x.com", "os", "token_issued") is not None

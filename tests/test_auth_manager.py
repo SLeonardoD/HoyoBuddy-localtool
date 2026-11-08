@@ -590,3 +590,184 @@ class TestLoginErrorMessages:
             assert _MESSAGES_FOR_FALLBACK[code] == config.LOGIN_ERROR_MESSAGES[code], (
                 f"Mensaje desincronizado para retcode {code}."
             )
+
+
+# ---------------------------------------------------------------------------
+# Renovacion del cookie_token_v2 (renew_cookie_token)
+#
+# BUG QUE CUBRE: el canje de codigos exige cookie_token_v2 y ese token
+# CADUCA. El codigo solo lo pedia cuando NO existia ("not in cookies"),
+# asi que uno vencido se quedaba guardado para siempre: el canje fallaba
+# con -1071 "Please log in to your account first" mientras check-in y
+# mimo (que no lo usan) seguian funcionando perfecto.
+# ---------------------------------------------------------------------------
+
+class TestRenewCookieToken:
+
+    @pytest.mark.asyncio
+    async def test_replaces_a_stale_token_that_already_exists(self, mock_store: MockAccountStore) -> None:
+        """
+        REGLA CLAVE: renovar NO depende de que el token falte. Un token
+        presente pero vencido se reemplaza, se guarda, y la sesion viva
+        lo ve (el dict se muta in place).
+        """
+        auth = AuthManager(mock_store)
+        cookies = {**TEST_COOKIES_OS_PRE_EXCHANGE, "cookie_token_v2": "STALE"}
+        payload = {"retcode": 0, "data": {"tokens": [
+            {"token_type": 2, "token": "NEW_LTOKEN"},
+            {"token_type": 4, "token": "NEW_COOKIE_TOKEN"},
+        ]}}
+
+        with aioresponses() as m:
+            m.post(COOKIE_V2_REFRESH_URL, payload=payload)
+            with patch("HoyoWrapper.auth_manager.random_delay", new=AsyncMock()):
+                ok = await auth.renew_cookie_token(TEST_EMAIL, "os", cookies, TEST_DEVICE_ID)
+
+        assert ok is True
+        assert cookies["cookie_token_v2"] == "NEW_COOKIE_TOKEN", (
+            f"El token vencido deberia haberse reemplazado. Cookies: {cookies}"
+        )
+        assert cookies["ltoken_v2"] == "NEW_LTOKEN"
+        persisted, _ = mock_store.get(TEST_EMAIL, "os")
+        assert persisted["cookie_token_v2"] == "NEW_COOKIE_TOKEN", (
+            "El token renovado debe persistirse, o se pierde en la proxima corrida."
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_session_sees_the_new_token(self, mock_store: MockAccountStore) -> None:
+        """
+        La HoyoSession comparte el dict de cookies (no una copia): tras
+        renovar, esa MISMA sesion ya usa el token nuevo sin reconstruirla.
+        Los juegos ya creados sobre esa sesion dependen de esto.
+        """
+        auth = AuthManager(mock_store)
+        cookies = {**TEST_COOKIES_OS_PRE_EXCHANGE, "cookie_token_v2": "STALE"}
+        session = HoyoSession(cookies, "os", TEST_DEVICE_ID)
+
+        with patch.object(auth, "_fetch_cookie_token", new=AsyncMock(
+            return_value={"cookie_token_v2": "NEW"}
+        )):
+            with patch("HoyoWrapper.auth_manager.random_delay", new=AsyncMock()):
+                await auth.renew_cookie_token(TEST_EMAIL, "os", cookies, TEST_DEVICE_ID)
+
+        assert session.cookies["cookie_token_v2"] == "NEW"
+
+    @pytest.mark.asyncio
+    async def test_delay_happens_before_the_request(self, mock_store: MockAccountStore) -> None:
+        """ANTI-BANEO: con config.DELAY_LOGIN_TO_COOKIE_EXCHANGE y ANTES de la request, no despues."""
+        auth = AuthManager(mock_store)
+        events: list = []
+
+        async def fake_delay(min_s, max_s):
+            events.append(("delay", (min_s, max_s)))
+
+        async def fake_fetch(cookies):
+            events.append(("fetch",))
+            return {"cookie_token_v2": "NEW"}
+
+        with patch.object(auth, "_fetch_cookie_token", side_effect=fake_fetch):
+            with patch("HoyoWrapper.auth_manager.random_delay", side_effect=fake_delay):
+                await auth.renew_cookie_token(
+                    TEST_EMAIL, "os", dict(TEST_COOKIES_OS_PRE_EXCHANGE), TEST_DEVICE_ID
+                )
+
+        assert events == [("delay", config.DELAY_LOGIN_TO_COOKIE_EXCHANGE), ("fetch",)], (
+            f"Orden esperado: delay y despues request. Obtenido: {events}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", ["stoken", "ltmid_v2"])
+    async def test_cannot_renew_without_stoken_or_ltmid(
+        self, mock_store: MockAccountStore, missing: str
+    ) -> None:
+        """
+        Sin stoken o sin ltmid_v2 no hay con que pedir el token: devuelve
+        False sin gastar delay ni request (no tiene sentido simular una
+        espera para algo que no va a ocurrir) y sin tocar el store.
+        """
+        auth = AuthManager(mock_store)
+        cookies = {k: v for k, v in TEST_COOKIES_OS_PRE_EXCHANGE.items() if k != missing}
+
+        with patch.object(auth, "_fetch_cookie_token", new=AsyncMock()) as fetch:
+            with patch("HoyoWrapper.auth_manager.random_delay", new=AsyncMock()) as delay:
+                ok = await auth.renew_cookie_token(TEST_EMAIL, "os", cookies, TEST_DEVICE_ID)
+
+        assert ok is False
+        fetch.assert_not_awaited()
+        delay.assert_not_awaited()
+        assert not [c for c in mock_store.calls if c[0] == "set"]
+
+    @pytest.mark.asyncio
+    async def test_cn_is_never_renewed(self, mock_store: MockAccountStore) -> None:
+        """CN (Miyoushe) no tiene cookie_token_v2: ni se intenta."""
+        auth = AuthManager(mock_store)
+        with patch.object(auth, "_fetch_cookie_token", new=AsyncMock()) as fetch:
+            ok = await auth.renew_cookie_token(
+                TEST_EMAIL, "cn", dict(TEST_COOKIES_OS_PRE_EXCHANGE), TEST_DEVICE_ID
+            )
+        assert ok is False
+        fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_exchange_keeps_old_cookies_and_store(self, mock_store: MockAccountStore) -> None:
+        """
+        Si el intercambio falla, devuelve False y NO toca nada: ni las
+        cookies en memoria ni lo guardado (un token viejo, aunque venza,
+        no se debe perder por un error de red pasajero).
+        """
+        auth = AuthManager(mock_store)
+        cookies = {**TEST_COOKIES_OS_PRE_EXCHANGE, "cookie_token_v2": "OLD"}
+        before = dict(cookies)
+
+        with patch.object(auth, "_fetch_cookie_token", new=AsyncMock(return_value={})):
+            with patch("HoyoWrapper.auth_manager.random_delay", new=AsyncMock()):
+                ok = await auth.renew_cookie_token(TEST_EMAIL, "os", cookies, TEST_DEVICE_ID)
+
+        assert ok is False
+        assert cookies == before
+        assert not [c for c in mock_store.calls if c[0] == "set"]
+
+
+# ---------------------------------------------------------------------------
+# Login real forzado (force_fresh)
+#
+# BUG QUE CUBRE: "Reingresar contrasena" llamaba a login(), que primero
+# prueba las cookies guardadas; si el ltoken seguia vivo las devolvia tal
+# cual y NUNCA usaba la contrasena. Resultado: reingresarla no renovaba
+# nada, ni siquiera un cookie_token_v2 vencido.
+# ---------------------------------------------------------------------------
+
+class TestForceFreshLogin:
+
+    @pytest.mark.asyncio
+    async def test_force_fresh_ignores_a_still_valid_stored_session(self, mock_store: MockAccountStore) -> None:
+        mock_store.seed(TEST_EMAIL, "os", dict(TEST_COOKIES_OS), TEST_DEVICE_ID)
+        auth = AuthManager(mock_store)
+        fresh = {**TEST_COOKIES_OS, "cookie_token_v2": "FRESH"}
+
+        with aioresponses() as m:
+            m.get(GAME_ACCOUNTS_OS_URL, payload=_ACCOUNTS_OK, repeat=True)
+            with patch.object(auth, "_do_login", new=AsyncMock(
+                return_value=(fresh, "new-device")
+            )) as do_login:
+                session = await auth.login(
+                    TEST_EMAIL, TEST_PASSWORD, region="os", force_fresh=True
+                )
+
+        do_login.assert_awaited_once()
+        assert session.cookies["cookie_token_v2"] == "FRESH"
+        persisted, _ = mock_store.get(TEST_EMAIL, "os")
+        assert persisted["cookie_token_v2"] == "FRESH", "Las cookies nuevas deben guardarse."
+
+    @pytest.mark.asyncio
+    async def test_default_login_still_reuses_a_valid_stored_session(self, mock_store: MockAccountStore) -> None:
+        """Contraste: sin force_fresh el comportamiento de siempre no cambia (sin login ni captcha)."""
+        mock_store.seed(TEST_EMAIL, "os", dict(TEST_COOKIES_OS), TEST_DEVICE_ID)
+        auth = AuthManager(mock_store)
+
+        with aioresponses() as m:
+            m.get(GAME_ACCOUNTS_OS_URL, payload=_ACCOUNTS_OK, repeat=True)
+            with patch.object(auth, "_do_login", new=AsyncMock()) as do_login:
+                await auth.login(TEST_EMAIL, TEST_PASSWORD, region="os")
+
+        do_login.assert_not_awaited()

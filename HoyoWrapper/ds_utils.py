@@ -23,11 +23,12 @@ no aca — este modulo es logica pura, no datos.
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import string
 import time
 
-__all__ = ["generate_dynamic_secret"]
+__all__ = ["generate_dynamic_secret", "generate_app_login_ds"]
 
 
 def generate_dynamic_secret(salt: str) -> str:
@@ -40,4 +41,27 @@ def generate_dynamic_secret(salt: str) -> str:
     t = int(time.time())
     r = "".join(random.choices(string.ascii_letters, k=6))
     h = hashlib.md5(f"salt={salt}&t={t}&r={r}".encode()).hexdigest()
+    return f"{t},{r},{h}"
+
+
+def generate_app_login_ds(body: dict, salt: str) -> str:
+    """
+    ds del login por app (appLoginByPassword). A diferencia de
+    generate_dynamic_secret(), el hash INCLUYE el cuerpo del request:
+        md5("salt=...&t=...&r=...&b=<json compacto del body>&q=")
+    y el componente aleatorio usa letras Y digitos.
+
+    Replica genshin/utility/ds.py::generate_app_login_ds (que a su vez
+    copia RequestUtils.createSign() de la app oficial). El body se
+    serializa con separadores compactos (",", ":") para calcular la
+    firma, igual que hace genshin.py.
+
+    Parametros:
+        body    El mismo dict que se envia como JSON.
+        salt    config.DS_SALT_APP_LOGIN.
+    """
+    t = int(time.time())
+    r = "".join(random.choices(string.ascii_letters + string.digits, k=6))
+    b = json.dumps(body, separators=(",", ":"))
+    h = hashlib.md5(f"salt={salt}&t={t}&r={r}&b={b}&q=".encode()).hexdigest()
     return f"{t},{r},{h}"

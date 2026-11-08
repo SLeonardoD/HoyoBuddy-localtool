@@ -411,3 +411,34 @@ class TestHoyoManagerLogin:
             await manager.logout(TEST_EMAIL)
 
         mock_logout.assert_called_once_with(TEST_EMAIL)
+
+
+class TestHoyoManagerTokenAndFreshLogin:
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("flag", [True, False])
+    async def test_login_passes_force_fresh_to_auth(self, flag: bool) -> None:
+        """force_fresh llega intacto hasta AuthManager.login() (por defecto False)."""
+        manager = HoyoManager(MockAccountStore())
+        session = HoyoSession(TEST_COOKIES_OS, "os", TEST_DEVICE_ID)
+        session.get_game_accounts = AsyncMock(return_value=TEST_ACCOUNTS)
+
+        with patch.object(manager._auth, "login", new=AsyncMock(return_value=session)) as auth_login:
+            with patch("HoyoWrapper.session_manager.random_delay", new=AsyncMock()):
+                if flag:
+                    await manager.login(TEST_EMAIL, TEST_PASSWORD, region="os", force_fresh=True)
+                else:
+                    await manager.login(TEST_EMAIL, TEST_PASSWORD, region="os")
+
+        assert auth_login.await_args.kwargs["force_fresh"] is flag
+
+    @pytest.mark.asyncio
+    async def test_renew_cookie_token_delegates_to_auth(self) -> None:
+        manager = HoyoManager(MockAccountStore())
+        cookies = dict(TEST_COOKIES_OS)
+
+        with patch.object(manager._auth, "renew_cookie_token", new=AsyncMock(return_value=True)) as renew:
+            result = await manager.renew_cookie_token(TEST_EMAIL, "os", cookies, TEST_DEVICE_ID)
+
+        assert result is True
+        renew.assert_awaited_once_with(TEST_EMAIL, "os", cookies, TEST_DEVICE_ID)
