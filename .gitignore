@@ -223,5 +223,4 @@ error_log*.txt
 hoyo_auth.db
 *.db
 
-bat-exe.bat
-bat-test.bat
+*.bat
