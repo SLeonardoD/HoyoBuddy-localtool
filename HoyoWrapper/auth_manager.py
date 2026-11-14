@@ -67,6 +67,11 @@ _APP_LOGIN_HEADERS: dict[str, str] = {**config.APP_LOGIN_HEADERS, "User-Agent": 
 _APP_EMAIL_SEND_HEADERS: dict[str, str] = {**config.APP_EMAIL_SEND_HEADERS, "User-Agent": _USER_AGENT}
 _APP_EMAIL_VERIFY_HEADERS: dict[str, str] = {**_APP_EMAIL_SEND_HEADERS}
 
+# Resultado del envio del codigo por email (modo app).
+_EMAIL_SENT = "sent"        # HoYoverse confirmo el envio
+_EMAIL_RECENT = "recent"    # -3206: ya habia enviado uno hace poco
+_EMAIL_CAPTCHA = "captcha"  # -3101: pidio captcha; el correo normalmente sale igual
+
 # Mensajes de errores de credenciales — usados para decidir si hacer fallback a CN
 _MESSAGES_FOR_FALLBACK: dict[int, str] = {
     code: config.LOGIN_ERROR_MESSAGES[code]
@@ -432,16 +437,30 @@ class AuthManager:
         logger.debug("[AUTH] Reintentando login por app tras el captcha...")
         return await self._app_login_post(payload, headers)
 
-    async def _send_verification_email_app(self, ticket: str) -> None:
+    async def _send_verification_email_app(
+        self, ticket: str, *, solve_captcha: bool = False,
+    ) -> str:
         """
-        Envia el codigo de verificacion por email en el modo app.
+        Pide a HoYoverse que envie el codigo de verificacion (modo app).
+        Devuelve _EMAIL_SENT, _EMAIL_RECENT o _EMAIL_CAPTCHA; cualquier otro
+        retcode lanza LoginError.
 
-        Replica genshin.py (subclients/app.py: _send_verification_email): las
-        cabeceras son SOLO app_id y client_type. No lleva el x-rpc-aigis del
-        login (ese captcha ya se consumio; reenviarlo produjo
-        "-3102 Verification code failed" en vivo) ni el x-rpc-device_id. Si
-        el propio endpoint pide un captcha (-3101) se resuelve uno NUEVO y se
-        reenvia, una sola vez.
+        Replica genshin.py: cabeceras SOLO app_id y client_type — sin el
+        x-rpc-aigis del login (ese captcha ya se consumio; reenviarlo dio
+        -3102 GeetestFailed en vivo) ni el x-rpc-device_id.
+
+          0      -> _EMAIL_SENT.
+          -3206  -> _EMAIL_RECENT: ya se envio un codigo hace poco. NO es un
+                    error: hay que usar ese codigo. (Antes abortaba aca y
+                    el usuario recibia el correo sin que la app se lo pidiera.)
+          -3101  -> HoYoverse pide un captcha para esta request, pero el
+                    correo normalmente sale igual con la PRIMERA peticion
+                    (genshin.py resuelve ese captcha y sigue a pedir el
+                    codigo sin reenviar). Por defecto se devuelve
+                    _EMAIL_CAPTCHA sin reenviar: reenviar choca con el limite
+                    de frecuencia (-3206) y es una request de mas.
+                    Con solve_captcha=True (reenvio a pedido del usuario) se
+                    resuelve un captcha NUEVO y se reenvia, una sola vez.
         """
         headers = {**_APP_EMAIL_SEND_HEADERS}
         payload = {"action_type": "verify_for_component", "action_ticket": ticket}
@@ -453,12 +472,18 @@ class AuthManager:
             )
             resp = await self._raw_post(_SEND_VERIFICATION_URL, payload, headers)
             _log_response("send_verification_email (app)", resp)
+            retcode = resp["retcode"]
 
-            if resp["retcode"] == 0:
-                return
-            if resp["retcode"] == config.APP_LOGIN_CAPTCHA_RETCODE and attempt == 1:
-                headers["x-rpc-aigis"] = await self._solve_app_captcha(resp)
-                continue
+            if retcode == 0:
+                return _EMAIL_SENT
+            if retcode == config.APP_EMAIL_RATE_LIMIT_RETCODE:
+                return _EMAIL_RECENT
+            if retcode == config.APP_LOGIN_CAPTCHA_RETCODE:
+                if not solve_captcha:
+                    return _EMAIL_CAPTCHA
+                if attempt == 1:
+                    headers["x-rpc-aigis"] = await self._solve_app_captcha(resp)
+                    continue
             break
 
         logger.error(
@@ -469,6 +494,84 @@ class AuthManager:
             f"No se pudo enviar el email de verificacion: "
             f"[{resp['retcode']}] {resp.get('message', '')}"
         )
+
+    @staticmethod
+    def _announce_email_status(status: str) -> None:
+        """Le dice al usuario (consola) que paso con el envio del correo y que hacer."""
+        if status == _EMAIL_SENT:
+            logger.info("[AUTH] HoYoverse envio el codigo de verificacion a tu correo.")
+        elif status == _EMAIL_RECENT:
+            logger.warning(
+                "[AUTH] HoYoverse indica que ya envio un codigo hace poco (-3206). "
+                "Usa el MAS RECIENTE de tu correo."
+            )
+        else:
+            logger.info(
+                "[AUTH] HoYoverse pidio una verificacion adicional (-3101), pero el "
+                "codigo normalmente se envia igual. Revisa tu correo; si no llega "
+                "en un minuto, escribe '{}' para reenviarlo.",
+                config.EMAIL_CODE_RESEND_KEYWORD,
+            )
+
+    async def _verify_email_app(self, ticket: str, risk_ticket: str) -> None:
+        """
+        Modo app: pide el codigo por email, lo recibe del usuario por consola y
+        se lo manda a HoYoverse. Vuelve cuando el codigo fue aceptado.
+
+        En el prompt: el codigo para verificarlo, 'r' para reenviarlo (una vez,
+        con un captcha nuevo) y Enter vacio para cancelar. Un codigo
+        incorrecto se puede reintentar hasta config.EMAIL_CODE_MAX_ATTEMPTS veces.
+        """
+        logger.info("[AUTH] Pidiendo a HoYoverse que envie el codigo de verificacion a tu correo...")
+        self._announce_email_status(await self._send_verification_email_app(ticket))
+
+        keyword = config.EMAIL_CODE_RESEND_KEYWORD
+        prompt = f"Codigo de verificacion de tu correo ({keyword} = reenviar, Enter = cancelar): "
+        wrong_codes = resends = 0
+
+        while True:
+            answer = (await enter_code(prompt)).strip()
+
+            if not answer:
+                raise LoginError("Verificacion por email cancelada por el usuario.")
+
+            if answer.lower() == keyword:
+                if resends >= config.EMAIL_CODE_MAX_RESENDS:
+                    logger.warning(
+                        "[AUTH] Ya reenviaste el codigo {} vez. Espera unos minutos "
+                        "y usa el codigo mas reciente de tu correo.", resends,
+                    )
+                    continue
+                resends += 1
+                try:
+                    status = await self._send_verification_email_app(ticket, solve_captcha=True)
+                except LoginError as e:
+                    # Puede que el usuario ya tenga un codigo valido: se sigue pidiendo.
+                    logger.warning("[AUTH] No se pudo reenviar el codigo: {}", e)
+                    continue
+                self._announce_email_status(status)
+                continue
+
+            logger.debug("[AUTH] Codigo introducido por el usuario. Verificando...")
+            try:
+                await self._verify_email_code(
+                    code=answer,
+                    action_ticket=risk_ticket,
+                    verify_ticket=ticket,
+                    headers=_APP_EMAIL_VERIFY_HEADERS,
+                )
+            except LoginError as e:
+                wrong_codes += 1
+                if wrong_codes >= config.EMAIL_CODE_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "[AUTH] Codigo rechazado ({}). Intento {}/{}. Escribelo de nuevo.",
+                    e, wrong_codes, config.EMAIL_CODE_MAX_ATTEMPTS,
+                )
+                continue
+
+            logger.info("[AUTH] Codigo de email verificado correctamente.")
+            return
 
     # ------------------------------------------------------------------
     # Medicion de la vida util del cookie_token_v2
@@ -1017,24 +1120,24 @@ class AuthManager:
             )
             raise LoginError(f"Estructura de verificacion de email inesperada: {e}")
 
-        logger.info("[AUTH] Enviando email de verificacion...")
         if app:
-            await self._send_verification_email_app(ticket_str)
+            await self._verify_email_app(ticket_str, action_ticket["risk_ticket"])
         else:
+            logger.info("[AUTH] Enviando email de verificacion...")
             await self._send_verification_email(
                 ticket_str, headers=headers, base_headers=None,
             )
 
-        code = await enter_code("Introduce el codigo de verificacion enviado a tu email: ")
-        logger.debug("[AUTH] Codigo introducido por el usuario. Verificando...")
+            code = await enter_code("Introduce el codigo de verificacion enviado a tu email: ")
+            logger.debug("[AUTH] Codigo introducido por el usuario. Verificando...")
 
-        await self._verify_email_code(
-            code=code,
-            action_ticket=action_ticket["risk_ticket"],
-            verify_ticket=ticket_str,
-            headers=_APP_EMAIL_VERIFY_HEADERS if app else None,
-        )
-        logger.info("[AUTH] Codigo de email verificado correctamente.")
+            await self._verify_email_code(
+                code=code,
+                action_ticket=action_ticket["risk_ticket"],
+                verify_ticket=ticket_str,
+                headers=None,
+            )
+            logger.info("[AUTH] Codigo de email verificado correctamente.")
 
         headers["x-rpc-verify"] = json.dumps({
             "risk_ticket": action_ticket["risk_ticket"],

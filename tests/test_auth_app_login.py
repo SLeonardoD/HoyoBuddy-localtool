@@ -347,7 +347,7 @@ class TestEmailVerificationModes:
             retried.append(dict(hdrs))
             return _resp(0)
 
-        with patch.object(auth, "_send_verification_email_app", new=AsyncMock()) as send_app, \
+        with patch.object(auth, "_send_verification_email_app", new=AsyncMock(return_value="sent")) as send_app, \
              patch.object(auth, "_send_verification_email", new=AsyncMock()) as send_web, \
              patch.object(auth, "_verify_email_code", new=AsyncMock()) as verify, \
              patch.object(auth, "_app_login_post", side_effect=fake_app_post), \
@@ -746,11 +746,14 @@ class TestAppLoginEndToEnd:
 # ---------------------------------------------------------------------------
 # Envio del codigo por email en modo app
 #
-# FALLO REAL EN VIVO: tras resolver el captcha del login, HoYoverse pidio
-# verificar el email (-3239) y el envio del codigo devolvio
-# "-3102 Verification code failed". Causa probable: se reenviaba al endpoint
-# del email el x-rpc-aigis (captcha ya consumido) y el device_id del login.
-# genshin.py manda ahi SOLO app_id y client_type.
+# FALLOS REALES EN VIVO (dos, en dos intentos distintos):
+#  1) -3102 (GeetestFailed): se reenviaba al endpoint del email el captcha
+#     ya consumido del login.
+#  2) -3206 (VerificationCodeRateLimited): el envio pedia captcha (-3101), el
+#     correo SALIA IGUAL, la app reenviaba tras resolverlo, chocaba con el
+#     limite de frecuencia y abortaba ANTES de pedirle el codigo al usuario
+#     — que ya lo tenia en su correo. Parecia que "la app no sabia recibir
+#     el codigo": el paso existia, pero nunca llegaba a ejecutarse.
 # ---------------------------------------------------------------------------
 
 class TestAppEmailSend:
@@ -771,8 +774,9 @@ class TestAppEmailSend:
         auth = _app_flow_auth()
         posts, patcher = self._capture(auth, [_resp(0)])
         with patcher:
-            await auth._send_verification_email_app("TK")
+            status = await auth._send_verification_email_app("TK")
 
+        assert status == am._EMAIL_SENT
         (post,) = posts
         assert post["url"] == config.SEND_VERIFICATION_URL
         assert post["payload"] == {"action_type": "verify_for_component", "action_ticket": "TK"}
@@ -781,16 +785,53 @@ class TestAppEmailSend:
         assert "x-rpc-device_id" not in post["headers"]
 
     @pytest.mark.asyncio
-    async def test_a_captcha_asked_by_the_send_itself_is_solved_fresh_and_resent_once(self) -> None:
+    async def test_rate_limit_is_not_an_error(self) -> None:
+        """-3206 = "ya se envio un codigo hace poco": hay que usarlo, no abortar."""
+        auth = _app_flow_auth()
+        posts, patcher = self._capture(auth, [_resp(-3206, message="Verification code requests too frequent.")])
+        with patcher:
+            status = await auth._send_verification_email_app("TK")
+
+        assert status == am._EMAIL_RECENT
+        assert len(posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_captcha_on_send_is_not_resent_by_default(self) -> None:
+        """
+        HoYoverse pide captcha pero el correo sale igual con la primera
+        peticion (asi lo trata genshin.py, y asi lo observamos). Reenviar es
+        una request de mas que ademas choca con el limite de frecuencia.
+        """
+        auth = _app_flow_auth()
+        posts, patcher = self._capture(auth, [_resp(-3101, headers={"x-rpc-aigis": "{}"})])
+        with patcher, patch.object(auth, "_solve_app_captcha", new=AsyncMock()) as solve:
+            status = await auth._send_verification_email_app("TK")
+
+        assert status == am._EMAIL_CAPTCHA
+        assert len(posts) == 1
+        solve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_resend_solves_a_fresh_captcha_and_resends_once(self) -> None:
         auth = _app_flow_auth()
         posts, patcher = self._capture(auth, [_resp(-3101, headers={"x-rpc-aigis": "{}"}), _resp(0)])
         with patcher, patch.object(auth, "_solve_app_captcha", new=AsyncMock(return_value="S;nuevo")) as solve:
-            await auth._send_verification_email_app("TK")
+            status = await auth._send_verification_email_app("TK", solve_captcha=True)
 
+        assert status == am._EMAIL_SENT
         solve.assert_awaited_once()
         assert len(posts) == 2
         assert "x-rpc-aigis" not in posts[0]["headers"]
         assert posts[1]["headers"]["x-rpc-aigis"] == "S;nuevo"
+
+    @pytest.mark.asyncio
+    async def test_a_resend_can_also_report_the_rate_limit(self) -> None:
+        auth = _app_flow_auth()
+        posts, patcher = self._capture(auth, [_resp(-3101, headers={"x-rpc-aigis": "{}"}), _resp(-3206)])
+        with patcher, patch.object(auth, "_solve_app_captcha", new=AsyncMock(return_value="S;x")):
+            status = await auth._send_verification_email_app("TK", solve_captcha=True)
+
+        assert status == am._EMAIL_RECENT
 
     @pytest.mark.asyncio
     async def test_other_errors_are_reported_with_their_code_and_not_retried(self) -> None:
@@ -798,7 +839,7 @@ class TestAppEmailSend:
         posts, patcher = self._capture(auth, [_resp(-3102, message="Verification code failed, please try again")])
         with patcher, patch.object(auth, "_solve_app_captcha", new=AsyncMock()) as solve:
             with pytest.raises(LoginError, match=r"\[-3102\]"):
-                await auth._send_verification_email_app("TK")
+                await auth._send_verification_email_app("TK", solve_captcha=True)
 
         assert len(posts) == 1
         solve.assert_not_awaited()
@@ -810,34 +851,178 @@ class TestAppEmailSend:
         posts, patcher = self._capture(auth, [again, again])
         with patcher, patch.object(auth, "_solve_app_captcha", new=AsyncMock(return_value="S;x")) as solve:
             with pytest.raises(LoginError):
-                await auth._send_verification_email_app("TK")
+                await auth._send_verification_email_app("TK", solve_captcha=True)
 
         assert len(posts) == 2
         solve.assert_awaited_once()
 
 
+# ---------------------------------------------------------------------------
+# El prompt del codigo: recibirlo del usuario y mandarselo a HoYoverse
+# ---------------------------------------------------------------------------
+
+class TestEmailCodePrompt:
+
+    @staticmethod
+    def _patched(auth: AuthManager, *, send, answers, verify=None):
+        return (
+            patch.object(auth, "_send_verification_email_app", new=AsyncMock(side_effect=send)),
+            patch("HoyoWrapper.auth_manager.enter_code", new=AsyncMock(side_effect=answers)),
+            patch.object(auth, "_verify_email_code", new=AsyncMock(side_effect=verify)),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["sent", "recent", "captcha"])
+    async def test_the_code_is_always_asked_whatever_the_send_status(self, status: str) -> None:
+        """
+        REGRESION del fallo real: con "recent" (-3206) o "captcha" (-3101) el
+        correo igual llega, asi que la app DEBE pedir el codigo y mandarselo a
+        HoYoverse. Antes abortaba antes de preguntar.
+        """
+        auth = _app_flow_auth()
+        send_p, ask_p, verify_p = self._patched(auth, send=[status], answers=["123456"])
+        with send_p as send, ask_p as ask, verify_p as verify:
+            await auth._verify_email_app("TK", "RT")
+
+        send.assert_awaited_once()
+        ask.assert_awaited_once()
+        assert verify.await_args.kwargs == {
+            "code": "123456", "action_ticket": "RT", "verify_ticket": "TK",
+            "headers": am._APP_EMAIL_VERIFY_HEADERS,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_captcha_status_does_not_resend_on_its_own(self) -> None:
+        auth = _app_flow_auth()
+        send_p, ask_p, verify_p = self._patched(auth, send=["captcha"], answers=["123456"])
+        with send_p as send, ask_p, verify_p:
+            await auth._verify_email_app("TK", "RT")
+
+        send.assert_awaited_once_with("TK")
+
+    @pytest.mark.asyncio
+    async def test_an_empty_answer_cancels_without_calling_hoyoverse(self) -> None:
+        auth = _app_flow_auth()
+        send_p, ask_p, verify_p = self._patched(auth, send=["sent"], answers=["   "])
+        with send_p, ask_p, verify_p as verify:
+            with pytest.raises(LoginError, match="cancelada"):
+                await auth._verify_email_app("TK", "RT")
+
+        verify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_wrong_code_can_be_retyped(self) -> None:
+        auth = _app_flow_auth()
+        send_p, ask_p, verify_p = self._patched(
+            auth, send=["sent"], answers=["111111", "222222"],
+            verify=[LoginError("incorrecto"), None],
+        )
+        with send_p, ask_p as ask, verify_p as verify:
+            await auth._verify_email_app("TK", "RT")
+
+        assert verify.await_count == 2 and ask.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_the_maximum_number_of_wrong_codes(self) -> None:
+        """No se martilla el endpoint de verificacion con intentos ilimitados."""
+        auth = _app_flow_auth()
+        n = config.EMAIL_CODE_MAX_ATTEMPTS
+        send_p, ask_p, verify_p = self._patched(
+            auth, send=["sent"], answers=[str(i) for i in range(n)],
+            verify=[LoginError("incorrecto")] * n,
+        )
+        with send_p, ask_p, verify_p as verify:
+            with pytest.raises(LoginError, match="incorrecto"):
+                await auth._verify_email_app("TK", "RT")
+
+        assert verify.await_count == n
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("keyword", ["r", "R"])
+    async def test_the_resend_keyword_resends_once_with_a_new_captcha(self, keyword: str) -> None:
+        auth = _app_flow_auth()
+        send_p, ask_p, verify_p = self._patched(auth, send=["captcha", "sent"], answers=[keyword, "123456"])
+        with send_p as send, ask_p, verify_p as verify:
+            await auth._verify_email_app("TK", "RT")
+
+        assert send.await_count == 2
+        assert send.await_args_list[1].kwargs == {"solve_captcha": True}
+        assert verify.await_args.kwargs["code"] == "123456", "'r' no se manda como si fuera el codigo."
+
+    @pytest.mark.asyncio
+    async def test_a_second_resend_is_refused(self, captured_logs: list) -> None:
+        """Cada reenvio exige un captcha nuevo y alimenta el limite de frecuencia: solo uno."""
+        auth = _app_flow_auth()
+        send_p, ask_p, verify_p = self._patched(auth, send=["captcha", "sent"], answers=["r", "r", "123456"])
+        with send_p as send, ask_p, verify_p as verify:
+            await auth._verify_email_app("TK", "RT")
+
+        assert send.await_count == 2, "El envio inicial + UN reenvio, no mas."
+        verify.assert_awaited_once()
+        assert "Ya reenviaste" in "\n".join(captured_logs)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_resend_keeps_asking_for_the_code(self) -> None:
+        """Si el reenvio falla, el usuario todavia puede tener un codigo valido de antes."""
+        auth = _app_flow_auth()
+        send_p, ask_p, verify_p = self._patched(
+            auth, send=["captcha", LoginError("boom")], answers=["r", "123456"],
+        )
+        with send_p, ask_p, verify_p as verify:
+            await auth._verify_email_app("TK", "RT")
+
+        verify.assert_awaited_once()
+
+    def test_each_status_tells_the_user_what_to_do(self, captured_logs: list) -> None:
+        for status in (am._EMAIL_SENT, am._EMAIL_RECENT, am._EMAIL_CAPTCHA):
+            AuthManager._announce_email_status(status)
+        text = "\n".join(captured_logs)
+
+        assert "envio el codigo" in text
+        assert "-3206" in text and "MAS RECIENTE" in text
+        assert "-3101" in text and f"'{config.EMAIL_CODE_RESEND_KEYWORD}'" in text
+
+
+class TestEmailConfig:
+
+    def test_values_are_sane(self) -> None:
+        assert config.APP_EMAIL_RATE_LIMIT_RETCODE == -3206  # VerificationCodeRateLimited (genshin.py)
+        assert config.EMAIL_CODE_MAX_ATTEMPTS >= 1
+        assert config.EMAIL_CODE_MAX_RESENDS >= 0
+        keyword = config.EMAIL_CODE_RESEND_KEYWORD
+        assert keyword and keyword == keyword.lower() and " " not in keyword, (
+            "El prompt compara en minusculas: una palabra con mayusculas nunca coincidiria."
+        )
+        assert not keyword.isdigit(), "No puede confundirse con un codigo de verificacion."
+
+
+# ---------------------------------------------------------------------------
+# Secuencias completas de dispositivo nuevo (login real, HTTP simulado)
+# ---------------------------------------------------------------------------
+
 class TestNewDeviceLoginSequence:
-    """La secuencia completa del fallo real: captcha v4 -> dispositivo nuevo -> email -> login."""
+
+    _AIGIS = json.dumps({"session_id": "S1", "mmt_type": 1,
+                         "data": json.dumps({"gt": "CAPID", "use_v4": True, "risk_type": "slide"})})
+    _VERIFY = json.dumps({"risk_ticket": "RT",
+                          "verify_str": json.dumps({"ticket": "TK", "verify_type": "2"})})
+    _V4 = {"captcha_id": "CAPID", "lot_number": "L", "pass_token": "P",
+           "gen_time": "1", "captcha_output": "O", "session_id": "S1"}
+
+    def _login_prefix(self) -> list:
+        return [
+            _resp(-3101, headers={"x-rpc-aigis": self._AIGIS}),    # login: pide captcha
+            _resp(-3239, headers={"x-rpc-verify": self._VERIFY}),  # login + captcha: dispositivo nuevo
+        ]
 
     @pytest.mark.asyncio
     async def test_captcha_then_new_device_then_email_then_login(self) -> None:
+        """Camino feliz: el envio del correo responde 0."""
         auth = _app_flow_auth()
-        aigis = json.dumps({"session_id": "S1", "mmt_type": 1,
-                            "data": json.dumps({"gt": "CAPID", "use_v4": True, "risk_type": "slide"})})
-        verify = json.dumps({"risk_ticket": "RT",
-                             "verify_str": json.dumps({"ticket": "TK", "verify_type": "2"})})
-        v4 = {"captcha_id": "CAPID", "lot_number": "L", "pass_token": "P",
-              "gen_time": "1", "captcha_output": "O", "session_id": "S1"}
-        responses = [
-            _resp(-3101, headers={"x-rpc-aigis": aigis}),       # 1. login: pide captcha
-            _resp(-3239, headers={"x-rpc-verify": verify}),     # 2. login + captcha: dispositivo nuevo
-            _resp(0),                                           # 3. enviar codigo por email
-            _resp(0),                                           # 4. verificar codigo
-            _resp(0, _APP_OK_DATA),                             # 5. login + ticket: OK
-        ]
+        responses = self._login_prefix() + [_resp(0), _resp(0), _resp(0, _APP_OK_DATA)]
 
         with _patched_flow(auth, responses) as (posts, _f, _d):
-            with patch("HoyoWrapper.auth_manager.solve_geetest_v4", new=AsyncMock(return_value=v4)), \
+            with patch("HoyoWrapper.auth_manager.solve_geetest_v4", new=AsyncMock(return_value=self._V4)), \
                  patch("HoyoWrapper.auth_manager.enter_code", new=AsyncMock(return_value="654321")):
                 cookies, _ = await auth._os_app_login_flow(TEST_EMAIL, TEST_PASSWORD, device_id="dev12345678901ab")
 
@@ -846,13 +1031,60 @@ class TestNewDeviceLoginSequence:
             config.VERIFY_EMAIL_URL, config.APP_LOGIN_URL,
         ]
         assert "x-rpc-aigis" in posts[1]["headers"], "El reintento tras el captcha si lo lleva."
-
-        send_headers = posts[2]["headers"]
-        assert "x-rpc-aigis" not in send_headers, "El captcha del login ya se consumio."
-        assert "x-rpc-device_id" not in send_headers
-
+        assert "x-rpc-aigis" not in posts[2]["headers"], "El captcha del login ya se consumio."
+        assert "x-rpc-device_id" not in posts[2]["headers"]
         final = posts[4]["headers"]
         assert "x-rpc-aigis" not in final, "Tras verificar el email no se reenvia el captcha viejo."
         assert json.loads(final["x-rpc-verify"])["risk_ticket"] == "RT"
         assert final["x-rpc-device_id"] == "dev12345678901ab"
+        assert cookies["stoken"] == "v2_STOKEN_VALUE"
+
+    @pytest.mark.asyncio
+    async def test_the_real_failing_sequence_now_asks_for_the_code(self) -> None:
+        """
+        LA SECUENCIA DEL LOG: el envio responde -3101 (captcha) y el correo
+        llega igual. Antes: se resolvia otro captcha, se reenviaba, -3206 y
+        abortaba sin preguntar nada. Ahora: UN solo envio, se le pide el
+        codigo al usuario, se verifica y se completa el login.
+        """
+        auth = _app_flow_auth()
+        send_asks_captcha = _resp(-3101, headers={"x-rpc-aigis": "{}"})
+        responses = self._login_prefix() + [send_asks_captcha, _resp(0), _resp(0, _APP_OK_DATA)]
+
+        with _patched_flow(auth, responses) as (posts, _f, _d):
+            with patch("HoyoWrapper.auth_manager.solve_geetest_v4", new=AsyncMock(return_value=self._V4)) as solve, \
+                 patch("HoyoWrapper.auth_manager.enter_code", new=AsyncMock(return_value="654321")) as ask:
+                cookies, _ = await auth._os_app_login_flow(TEST_EMAIL, TEST_PASSWORD)
+
+        assert [p["url"] for p in posts] == [
+            config.APP_LOGIN_URL, config.APP_LOGIN_URL, config.SEND_VERIFICATION_URL,
+            config.VERIFY_EMAIL_URL, config.APP_LOGIN_URL,
+        ], "Un solo envio: sin reenvio automatico."
+        solve.assert_awaited_once()   # solo el captcha del login
+        ask.assert_awaited_once()     # y SI se le pidio el codigo al usuario
+        assert posts[3]["payload"]["email_captcha"] == "654321"
+        assert cookies["stoken"] == "v2_STOKEN_VALUE"
+
+    @pytest.mark.asyncio
+    async def test_resend_on_demand_when_the_email_never_arrives(self) -> None:
+        """El usuario escribe 'r': se reenvia con un captcha NUEVO y despues se verifica el codigo."""
+        auth = _app_flow_auth()
+        ask_captcha = _resp(-3101, headers={"x-rpc-aigis": "{}"})
+        responses = self._login_prefix() + [
+            ask_captcha,                # envio inicial: pide captcha
+            ask_captcha, _resp(-3206),  # reenvio: pide captcha, se resuelve, llega -3206 (ya salio uno)
+            _resp(0),                   # verificar el codigo
+            _resp(0, _APP_OK_DATA),     # login final
+        ]
+
+        with _patched_flow(auth, responses) as (posts, _f, _d):
+            with patch.object(auth, "_solve_app_captcha", new=AsyncMock(return_value="S;x")), \
+                 patch("HoyoWrapper.auth_manager.enter_code", new=AsyncMock(side_effect=["r", "654321"])):
+                cookies, _ = await auth._os_app_login_flow(TEST_EMAIL, TEST_PASSWORD)
+
+        urls = [p["url"] for p in posts]
+        assert urls.count(config.SEND_VERIFICATION_URL) == 3
+        sends = [p for p in posts if p["url"] == config.SEND_VERIFICATION_URL]
+        assert "x-rpc-aigis" not in sends[0]["headers"] and "x-rpc-aigis" not in sends[1]["headers"]
+        assert sends[2]["headers"]["x-rpc-aigis"] == "S;x", "El reenvio lleva el captcha NUEVO."
         assert cookies["stoken"] == "v2_STOKEN_VALUE"

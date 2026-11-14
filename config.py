@@ -632,3 +632,12 @@ APP_LOGIN_EMAIL_VERIFY_RETCODE = -3239  # dispositivo nuevo: pide verificacion p
 TOKEN_EVENT_ISSUED = "token_issued"        # se emitio un token (login o renovacion)
 TOKEN_EVENT_USE_OK = "token_use_ok"        # un canje demostro que el token servia
 TOKEN_EVENT_USE_FAIL = "token_use_fail"    # un canje fallo por sesion (-1071)
+
+# Verificacion por email del login por app.
+# -3206 = VerificationCodeRateLimited en genshin.py ("pediste el codigo
+# demasiado seguido"): HoYoverse YA envio uno hace poco. No es un fallo: hay
+# que usar ese codigo, no abortar.
+APP_EMAIL_RATE_LIMIT_RETCODE = -3206
+EMAIL_CODE_MAX_ATTEMPTS = 3        # veces que se puede escribir un codigo incorrecto
+EMAIL_CODE_MAX_RESENDS = 1         # reenvios a pedido (cada uno exige un captcha nuevo)
+EMAIL_CODE_RESEND_KEYWORD = "r"    # lo que se escribe en el prompt para reenviar

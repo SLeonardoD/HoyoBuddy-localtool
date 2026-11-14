@@ -230,7 +230,14 @@ El canje de códigos exige una cookie, `cookie_token_v2`, que **caduca**. Check-
 | Un canje devuelve `-1071` | Se renueva el token y se reintenta **una sola vez**. Nunca más de una renovación por cuenta y corrida. |
 | La renovación no es posible | Aparece un aviso `[!]` en el resumen: falta `stoken`/`ltmid_v2` (cuentas registradas antes con login web). Se arregla con la opción 8, que ahora hace un login real. |
 
-**La contraseña solo vuelve a hacer falta** para cuentas registradas con el login web antiguo, o si el propio `stoken` deja de servir (caso excepcional; el aviso lo señala). Reingresarla puede abrir el captcha y, si HoYoverse lo considera un dispositivo nuevo, pedir un código por email. El `device_id` se conserva entre logins de la misma cuenta justamente para evitarlo.
+**El primer login de una cuenta en este dispositivo** pasa por dos pasos que conviene conocer:
+
+1. Un captcha (Geetest v4), que se resuelve en el navegador que se abre.
+2. Un código de verificación por email, porque HoYoverse trata a la app como un dispositivo nuevo. El código llega a tu correo y se escribe en la consola. Ahí mismo: `r` reenvía el código (una vez, con un captcha nuevo), Enter vacío cancela, y un código incorrecto se puede reintentar hasta 3 veces.
+
+Si HoYoverse responde que ya envió un código hace poco (`-3206`), no es un error: hay que usar ese código. Después del primer login el `device_id` se conserva y no se vuelve a pedir.
+
+**La contraseña solo vuelve a hacer falta** para cuentas registradas con el login web antiguo, o si el propio `stoken` deja de servir (caso excepcional; el aviso lo señala). Reingresarla puede abrir el captcha y, si HoYoverse lo considera un dispositivo nuevo, pedir un código por email. En ese caso la consola te pide el código: lo escribís y se lo manda a HoYoverse (hasta 3 intentos si lo escribís mal); `r` pide que lo reenvíe (una sola vez, con un captcha nuevo) y Enter vacío cancela. Si HoYoverse responde que ya envió un código hace poco (`-3206`), no es un error: usá el más reciente de tu correo. El `device_id` se conserva entre logins de la misma cuenta justamente para evitarlo.
 
 ### Medición de la vida útil del token
 
