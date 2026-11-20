@@ -314,6 +314,15 @@ CN_CHECKIN_CHANNEL = "miyousheluodi"
 
 MIMO_BASE_URL = "https://sg-public-api.hoyolab.com/event/e2023mimotravel"
 
+# Segmento de ruta que usa SOLO el Mimo de Genshin (GAME_ID 2), entre la base y
+# el endpoint: <MIMO_BASE_URL>/<prefijo>/<endpoint con guiones bajos>.
+# HoYoverse lo rota sin aviso. Segun genshin.py (client/components/hoyolab.py,
+# _request_mimo): "nata" hasta la 1.7.21, "qiuqiu" desde la 1.7.22 (verificado
+# hasta la 1.7.32). Con "nata" el index de Genshin respondio 404 el 20/11/2026.
+# Si vuelve a dar 404 en .../<prefijo>/index: instalar la ultima genshin.py,
+# leer _request_mimo y corregir SOLO este valor. HSR y ZZZ no usan prefijo.
+MIMO_GENSHIN_PATH_PREFIX = "qiuqiu"
+
 # Tipos de tarea mimo completables via finish_mimo_task() (no requieren
 # accion real dentro del juego). NO incluir GI_LOGIN(5), GI_GAME(6),
 # HSR_GAME(8), ZZZ_DAILY_LOGIN(12), ZZZ_CONSECUTIVE_LOGIN(13), ZZZ_GAME(16)

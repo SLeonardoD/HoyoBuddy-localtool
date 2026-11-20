@@ -348,12 +348,15 @@ class BaseGame:
     def _mimo_url(self, endpoint: str) -> str:
         """
         URL del endpoint mimo.
-        Genshin (GAME_ID=2): /nata/<endpoint> con guiones->guiones_bajos.
+        Genshin (GAME_ID=2): /<config.MIMO_GENSHIN_PATH_PREFIX>/<endpoint> con
+        guiones->guiones_bajos. El prefijo se lee de config en cada llamada
+        porque HoYoverse lo rota (ver el comentario en config.py).
         Resto: /<endpoint> directamente.
         Fuente: genshin.py/hoyolab.py/_request_mimo()
         """
         if self.GAME_ID == 2:
-            return f"{_MIMO_BASE_URL}/nata/{endpoint.replace('-', '_')}"
+            prefix = config.MIMO_GENSHIN_PATH_PREFIX
+            return f"{_MIMO_BASE_URL}/{prefix}/{endpoint.replace('-', '_')}"
         return f"{_MIMO_BASE_URL}/{endpoint}"
 
     async def _get_mimo_version_id(self) -> int:

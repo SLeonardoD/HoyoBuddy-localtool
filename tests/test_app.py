@@ -11,8 +11,11 @@ de queries/constraints es parte de lo que se prueba).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiohttp
 import pytest
 
 from app import (
@@ -29,6 +32,7 @@ from app import (
     _process_mimo_tasks,
     _process_mimo_buys,
     _redeem_with_token_refresh,
+    _transport_error_text,
     get_token_report,
 )
 import config
@@ -1396,3 +1400,290 @@ class TestTokenReport:
 
         assert report["safe_interval_hours"] is None
         assert report["max_ok_age_hours"] == 22.0
+
+
+# ---------------------------------------------------------------------------
+# Fallos HTTP/de red (404, 5xx, timeout) — no deben abortar la corrida
+#
+# Incidente real (20/11/2026): el index del Mimo de Genshin respondio 404.
+# session.request deja pasar aiohttp.ClientResponseError (a proposito, para que
+# tenacity reintente los 429) y app.py solo capturaba HoyoAPIError: la
+# excepcion subio hasta main.py y se perdieron los juegos y cuentas que faltaban.
+# ---------------------------------------------------------------------------
+
+def _http_error(status: int = 404, message: str = "Not Found") -> aiohttp.ClientResponseError:
+    """Un fallo HTTP como el que lanza session.request via raise_for_status()."""
+    return aiohttp.ClientResponseError(
+        request_info=MagicMock(), history=(), status=status, message=message,
+    )
+
+
+def _daily_game(name: str = "Genshin Impact", biz: str = "hk4e_global", uid: str = "700000001") -> MagicMock:
+    """Juego mockeado con todo en orden: check-in hecho, sin tareas Mimo ni compras."""
+    game = MagicMock()
+    game.GAME_NAME = name
+    game.game_biz  = biz
+    game.uid       = uid
+    game.claim_daily_reward = AsyncMock(return_value={
+        "message": "ok", "already_done": True, "total_sign_day": 3,
+    })
+    game.get_mimo_tasks     = AsyncMock(return_value=[])
+    game.finish_mimo_task   = AsyncMock(return_value=None)
+    game.claim_mimo_task_reward = AsyncMock(return_value=None)
+    game.buy_mimo_currency  = AsyncMock(return_value=[])
+    return game
+
+
+async def _run_daily_with_games(ctx: AppContext, games: list) -> dict:
+    _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+    mock_active = MagicMock(spec=ActiveSession)
+    mock_active.games = games
+    with patch("app.restore_session", new=AsyncMock(return_value=mock_active)):
+        with patch("app.random_delay", new=AsyncMock()):
+            return await run_daily_tasks(ctx)
+
+
+class TestHttpErrorsDoNotAbortTheDailyRun:
+
+    @pytest.mark.asyncio
+    async def test_checkin_http_error_is_reported_and_the_run_continues(self, ctx: AppContext) -> None:
+        game_1 = _daily_game("Genshin Impact", "hk4e_global")
+        game_2 = _daily_game("Honkai: Star Rail", "hkrpg_global", uid="800000001")
+        game_1.claim_daily_reward = AsyncMock(side_effect=_http_error(404))
+
+        result = await _run_daily_with_games(ctx, [game_1, game_2])
+
+        account = result["accounts"][0]
+        assert account["success"] is True, "Un 404 en el check-in no debe romper la cuenta."
+        checkins = {t["game_name"]: t for t in account["tasks"] if t["type"] == "checkin"}
+        assert checkins["Genshin Impact"]["success"] is False
+        assert "404" in checkins["Genshin Impact"]["message"], (
+            f"El mensaje debe decir el estado HTTP. Obtenido: {checkins['Genshin Impact']['message']!r}"
+        )
+        assert checkins["Honkai: Star Rail"]["success"] is True, (
+            "El juego siguiente debe procesarse aunque el anterior fallo."
+        )
+        game_2.claim_daily_reward.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_mimo_is_reported_skips_the_shop_and_continues(self, ctx: AppContext) -> None:
+        """
+        El caso del log: el listado de tareas da 404. La tienda empezaria por
+        la misma request (el index no quedo en cache) y volveria a fallar:
+        NO debe intentarse. El juego siguiente si se procesa completo.
+        """
+        game_1 = _daily_game("Genshin Impact", "hk4e_global")
+        game_2 = _daily_game("Honkai: Star Rail", "hkrpg_global", uid="800000001")
+        game_1.get_mimo_tasks = AsyncMock(side_effect=_http_error(404))
+
+        result = await _run_daily_with_games(ctx, [game_1, game_2])
+
+        tasks = result["accounts"][0]["tasks"]
+        mimo_failures = [
+            t for t in tasks
+            if t["type"] == "mimo_task" and t["game_name"] == "Genshin Impact" and not t["success"]
+        ]
+        assert len(mimo_failures) == 1 and "HTTP 404" in mimo_failures[0]["message"], (
+            f"Debe quedar UN fallo de Mimo con el estado HTTP. Tareas: {tasks}"
+        )
+        game_1.get_mimo_tasks.assert_awaited_once()
+        game_1.buy_mimo_currency.assert_not_awaited()
+        game_2.get_mimo_tasks.assert_awaited_once()
+        game_2.buy_mimo_currency.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_mimo_flag_is_set_only_for_http_or_network_errors(self) -> None:
+        """Un retcode de la API (HoyoAPIError) conserva el comportamiento anterior: no marca 'unreachable'."""
+        api_game = _daily_game()
+        api_game.get_mimo_tasks = AsyncMock(side_effect=HoyoAPIError(-100, "x", {}))
+        http_game = _daily_game()
+        http_game.get_mimo_tasks = AsyncMock(side_effect=_http_error(503, "Service Unavailable"))
+        api_state: dict = {}
+        http_state: dict = {}
+
+        await _process_mimo_tasks(api_game, state=api_state)
+        await _process_mimo_tasks(http_game, state=http_state)
+
+        assert api_state == {}, "Un HoyoAPIError no debe marcar el Mimo como inalcanzable."
+        assert http_state == {"unreachable": True}, "Un 503 si debe marcarlo."
+
+    @pytest.mark.asyncio
+    async def test_finish_http_error_stops_the_remaining_finishes(self) -> None:
+        """ANTI-BANEO: si finish-task no responde, no se lo manda una vez por tarea."""
+        game = _daily_game()
+        game.get_mimo_tasks = AsyncMock(return_value=[
+            {"task_id": 1, "task_name": "Visitar A", "status": 2, "task_type": 2},
+            {"task_id": 2, "task_name": "Visitar B", "status": 2, "task_type": 2},
+            {"task_id": 3, "task_name": "Visitar C", "status": 2, "task_type": 2},
+        ])
+        game.finish_mimo_task = AsyncMock(side_effect=_http_error(500, "Internal Server Error"))
+
+        with patch("app.random_delay", new=AsyncMock()):
+            result = await _process_mimo_tasks(game)
+
+        assert game.finish_mimo_task.await_count == 1, (
+            f"Tras el primer fallo HTTP no debe seguir. Intentos: {game.finish_mimo_task.await_count}"
+        )
+        failures = [r for r in result if not r["success"]]
+        assert len(failures) == 1 and "HTTP 500" in failures[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_api_errors_on_finish_still_try_every_task(self) -> None:
+        """Preservacion: un retcode de la API NO corta el paso (es por tarea, no del endpoint)."""
+        game = _daily_game()
+        game.get_mimo_tasks = AsyncMock(return_value=[
+            {"task_id": 1, "task_name": "Visitar A", "status": 2, "task_type": 2},
+            {"task_id": 2, "task_name": "Visitar B", "status": 2, "task_type": 2},
+        ])
+        game.finish_mimo_task = AsyncMock(side_effect=HoyoAPIError(-5, "no se puede", {}))
+
+        with patch("app.random_delay", new=AsyncMock()):
+            await _process_mimo_tasks(game)
+
+        assert game.finish_mimo_task.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_claim_http_error_stops_the_remaining_claims(self) -> None:
+        game = _daily_game()
+        game.get_mimo_tasks = AsyncMock(return_value=[
+            {"task_id": 1, "task_name": "Tarea A", "status": 1, "task_type": 5},
+            {"task_id": 2, "task_name": "Tarea B", "status": 1, "task_type": 5},
+        ])
+        game.claim_mimo_task_reward = AsyncMock(side_effect=_http_error(502, "Bad Gateway"))
+
+        with patch("app.random_delay", new=AsyncMock()):
+            result = await _process_mimo_tasks(game)
+
+        assert game.claim_mimo_task_reward.await_count == 1
+        assert len(result) == 1 and result[0]["success"] is False
+        assert "HTTP 502" in result[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_shop_http_error_is_reported_not_raised(self) -> None:
+        game = _daily_game()
+        game.buy_mimo_currency = AsyncMock(side_effect=_http_error(503, "Service Unavailable"))
+
+        result = await _process_mimo_buys(game)
+
+        assert len(result) == 1 and result[0]["success"] is False
+        assert "HTTP 503" in result[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_handled_like_any_other_network_error(self) -> None:
+        game = _daily_game()
+        game.buy_mimo_currency = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        result = await _process_mimo_buys(game)
+
+        assert len(result) == 1 and result[0]["success"] is False
+        assert "TimeoutError" in result[0]["message"], (
+            f"Un timeout trae str() vacio: el mensaje debe nombrar el tipo. Obtenido: {result[0]['message']!r}"
+        )
+
+    def test_error_text_does_not_include_the_url(self) -> None:
+        """str(ClientResponseError) trae la URL completa; el texto para el resumen y el log, no."""
+        request_info = MagicMock()
+        request_info.real_url = "https://example.invalid/api?token=SECRETO"
+        err = aiohttp.ClientResponseError(
+            request_info=request_info, history=(), status=404, message="Not Found",
+        )
+
+        text = _transport_error_text(err)
+
+        assert text == "HTTP 404 Not Found", f"Obtenido: {text!r}"
+        assert "SECRETO" not in text and "example.invalid" not in text
+
+
+# ---------------------------------------------------------------------------
+# Canje de codigos ante fallos HTTP/de red
+# ---------------------------------------------------------------------------
+
+def _pending_aliases(ctx: AppContext, code: str, aliases: list[str], biz: str = "hk4e_global") -> list[str]:
+    """Alias para los que `code` sigue pendiente de canjear."""
+    return [
+        a for a in aliases
+        if any(r["code"] == code for r in ctx.code_store.get_pending_for_account(a, biz))
+    ]
+
+
+class TestHttpErrorsDuringRedeem:
+
+    @pytest.mark.asyncio
+    async def test_token_refresh_ignores_http_errors(self, ctx: AppContext) -> None:
+        """Un 404/timeout no dice nada del token: no renueva, no reintenta, propaga tal cual."""
+        game = MagicMock(redeem_code=AsyncMock(side_effect=_http_error(404)))
+
+        with patch("app.random_delay", new=AsyncMock()):
+            with pytest.raises(aiohttp.ClientResponseError):
+                await _redeem_with_token_refresh(ctx, _os_account(), game, "CODE")
+
+        assert game.redeem_code.await_count == 1, "No debe reintentarse un fallo HTTP."
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_manual_redeem_http_error_saves_nothing_and_stops(self, ctx: AppContext) -> None:
+        _seed_account(ctx.account_store, "Alice", "alice@example.com")
+        _seed_account(ctx.account_store, "Bob", "bob@example.com")
+        game_alice, game_bob = _daily_game(uid="1"), _daily_game(uid="2")
+        game_alice.redeem_code = AsyncMock(side_effect=_http_error(404))
+        game_bob.redeem_code   = AsyncMock(return_value=None)
+        sessions = {
+            "Alice": MagicMock(spec=ActiveSession, get_game=lambda biz: game_alice),
+            "Bob":   MagicMock(spec=ActiveSession, get_game=lambda biz: game_bob),
+        }
+
+        async def fake_restore(ctx, account):
+            return sessions[account["alias"]]
+
+        with patch("app.restore_session", side_effect=fake_restore):
+            with patch("app.random_delay", new=AsyncMock()):
+                results = await redeem_code_for_all(ctx, "hk4e_global", "CODIGO1")
+
+        assert len(results) == 1 and results[0]["success"] is False, (
+            f"Debe quedar un solo fallo (se corta). Resultados: {results}"
+        )
+        assert "HTTP 404" in results[0]["message"]
+        game_bob.redeem_code.assert_not_awaited()
+        code_row = next(c for c in ctx.code_store.list_codes("hk4e_global") if c["code"] == "CODIGO1")
+        assert code_row["status"] == "active", "Un fallo de red jamas marca un codigo como muerto."
+        assert _pending_aliases(ctx, "CODIGO1", ["Alice", "Bob"]) == ["Alice", "Bob"], (
+            "El codigo debe seguir pendiente para ambas cuentas (no se guardo ningun resultado)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_redeem_http_error_saves_nothing_and_stops_everything(self, ctx: AppContext) -> None:
+        """
+        ANTI-BANEO: ante un fallo de infraestructura el canje automatico se corta
+        completo (resto de codigos, juegos y cuentas); nada queda guardado, asi
+        que todo se reintenta en la proxima corrida.
+        """
+        _seed_account(ctx.account_store, "Alice", "alice@example.com")
+        _seed_account(ctx.account_store, "Bob", "bob@example.com")
+        game_alice, game_bob = _daily_game(uid="1"), _daily_game(uid="2")
+        game_alice.redeem_code = AsyncMock(side_effect=_http_error(503, "Service Unavailable"))
+        game_bob.redeem_code   = AsyncMock(return_value=None)
+        sessions = {
+            "Alice": MagicMock(spec=ActiveSession, games=[game_alice]),
+            "Bob":   MagicMock(spec=ActiveSession, games=[game_bob]),
+        }
+
+        async def fake_restore(ctx, account):
+            return sessions[account["alias"]]
+
+        for code in ["CODIGO1", "CODIGO2"]:
+            await add_gift_code(ctx, "hk4e_global", code)
+
+        with patch("app.restore_session", side_effect=fake_restore):
+            with patch("app.random_delay", new=AsyncMock()):
+                results = await redeem_pending_codes(ctx)
+
+        assert game_alice.redeem_code.await_count == 1, "Tras el fallo no debe probar el 2.o codigo."
+        game_bob.redeem_code.assert_not_awaited()
+        assert len(results) == 1 and results[0]["success"] is False
+        assert "HTTP 503" in results[0]["message"]
+        for code in ["CODIGO1", "CODIGO2"]:
+            assert _pending_aliases(ctx, code, ["Alice", "Bob"]) == ["Alice", "Bob"], (
+                f"{code} debe seguir pendiente para ambas cuentas."
+            )
+        statuses = {c["code"]: c["status"] for c in ctx.code_store.list_codes("hk4e_global")}
+        assert statuses == {"CODIGO1": "active", "CODIGO2": "active"}, f"Estados: {statuses}"

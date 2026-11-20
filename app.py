@@ -29,6 +29,7 @@ import random
 import typing
 from datetime import datetime, timezone
 
+import aiohttp
 from loguru import logger
 
 import config
@@ -59,6 +60,31 @@ __all__ = [
 # URLs de canje de codigos por juego (para mostrar al usuario tras compra
 # mimo). Definidas una sola vez en config.py.
 REDEEM_URLS: dict[str, str] = config.REDEEM_WEBPAGE_URLS
+
+# Errores que puede lanzar un paso contra HoYoverse sin que sea un bug:
+#   HoyoAPIError      HoYoverse respondio con retcode != 0.
+#   aiohttp.ClientError / TimeoutError
+#                     fallo HTTP o de red: un 404 por un endpoint que HoYoverse
+#                     movio (session.request deja pasar ClientResponseError
+#                     a proposito, para que tenacity reintente los 429), un
+#                     5xx, un corte de conexion, un timeout.
+# Un paso que falla se reporta y la corrida sigue con lo demas; antes solo se
+# capturaba HoyoAPIError y un 404 en un juego abortaba TODA la corrida.
+_TRANSPORT_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
+_STEP_ERRORS = (HoyoAPIError, *_TRANSPORT_ERRORS)
+
+
+def _transport_error_text(e: BaseException) -> str:
+    """Texto corto de un fallo HTTP/de red. Sin URL: solo estado o tipo de error."""
+    if isinstance(e, aiohttp.ClientResponseError):
+        return f"HTTP {e.status} {e.message}".strip()
+    detail = str(e)
+    return f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+
+
+def _error_text(e: BaseException) -> str:
+    """str(e) para un HoyoAPIError (sin cambios); texto corto para fallos HTTP/de red."""
+    return str(e) if isinstance(e, HoyoAPIError) else _transport_error_text(e)
 
 
 # ---------------------------------------------------------------------------
@@ -460,13 +486,13 @@ async def _process_account_games(
                 "message":   msg,
                 "detail":    "",
             })
-        except HoyoAPIError as e:
-            logger.error("    [Check-in] Error: {}", e)
+        except _STEP_ERRORS as e:
+            logger.error("    [Check-in] Error: {}", _error_text(e))
             tasks.append({
                 "type":      "checkin",
                 "game_name": game.GAME_NAME,
                 "success":   False,
-                "message":   str(e),
+                "message":   _error_text(e),
                 "detail":    "",
             })
 
@@ -475,10 +501,23 @@ async def _process_account_games(
         # sin ninguna espera — como si el navegador saltara de pagina
         # instantaneamente. Simula el tiempo de navegar a la seccion mimo.
         await random_delay(*config.DELAY_CHECKIN_TO_MIMO)
-        mimo_tasks = await _process_mimo_tasks(game)
+        mimo_state: dict[str, bool] = {}
+        mimo_tasks = await _process_mimo_tasks(game, state=mimo_state)
         tasks.extend(mimo_tasks)
 
         # ── Mimo: compra de moneda ───────────────────────────────────
+        # ANTI-BANEO: si el Mimo ni siquiera respondio al listar las tareas
+        # (404, 5xx, timeout), la tienda empezaria por la MISMA request
+        # (el index, que no quedo en cache) y volveria a fallar: no se
+        # insiste. Se vuelve a intentar en la proxima corrida.
+        if mimo_state.get("unreachable"):
+            logger.warning(
+                "    [Mimo compra] Omitida: el Mimo de {} no respondio al "
+                "listar las tareas; no se insiste con otra request.",
+                game.GAME_NAME,
+            )
+            continue
+
         # ANTI-BANEO: idem, transicion de la pestaña de tareas a la de
         # tienda dentro del mismo mimo — antes tambien sin espera.
         await random_delay(*config.DELAY_MIMO_TASKS_TO_SHOP)
@@ -488,7 +527,10 @@ async def _process_account_games(
     return tasks
 
 
-async def _process_mimo_tasks(game) -> list[TaskResult]:
+async def _process_mimo_tasks(
+    game,
+    state: typing.Optional[dict[str, bool]] = None,
+) -> list[TaskResult]:
     """
     Procesa tareas mimo completo:
       1. Tareas completables via API (VISIT, VIEW_TOPIC, TRAILER, etc.)
@@ -504,6 +546,13 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
         1 = FINISHED (completada, sin reclamar)
         2 = ONGOING  (en progreso / pendiente)
         3 = CLAIMED  (ya reclamada)
+
+    Fallos HTTP/de red (ver _TRANSPORT_ERRORS): se reportan sin propagarse y,
+    en un paso con varias requests iguales (completar o reclamar), se corta el
+    paso en la primera: si el endpoint no responde, las demas tampoco, y no
+    se las manda una por una al servidor. Si falla el LISTADO de tareas por
+    esta causa, se marca state["unreachable"] = True para que quien llama
+    omita la tienda (ver _process_account_games).
     """
     from HoyoWrapper.game_model import MIMO_FINISHABLE_TASK_TYPES
 
@@ -513,15 +562,18 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
         tasks = await game.get_mimo_tasks()
     except NotImplementedError:
         return []
-    except HoyoAPIError as e:
+    except _STEP_ERRORS as e:
         logger.warning(
-            "[APP] Error al obtener tareas mimo | game={} error={}", game.GAME_NAME, e
+            "[APP] Error al obtener tareas mimo | game={} error={}",
+            game.GAME_NAME, _error_text(e),
         )
+        if state is not None and isinstance(e, _TRANSPORT_ERRORS):
+            state["unreachable"] = True
         return [{
             "type":      "mimo_task",
             "game_name": game.GAME_NAME,
             "success":   False,
-            "message":   f"Error al obtener tareas: {e}",
+            "message":   f"Error al obtener tareas: {_error_text(e)}",
             "detail":    "",
         }]
 
@@ -563,19 +615,25 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
             )
             # Añadir a finished para reclamar en el paso 2
             finished.append(task)
-        except HoyoAPIError as e:
+        except _STEP_ERRORS as e:
             logger.warning(
-                "[APP] No se pudo completar tarea | game={} task={!r} "
-                "retcode={} message={!r}",
-                game.GAME_NAME, task_name, e.retcode, e.message
+                "[APP] No se pudo completar tarea | game={} task={!r} error={}",
+                game.GAME_NAME, task_name, _error_text(e)
             )
+            reason = e.message if isinstance(e, HoyoAPIError) else _transport_error_text(e)
             results.append({
                 "type":      "mimo_task",
                 "game_name": game.GAME_NAME,
                 "success":   False,
-                "message":   f"No se pudo completar: {e.message}",
+                "message":   f"No se pudo completar: {reason}",
                 "detail":    task_name,
             })
+            if isinstance(e, _TRANSPORT_ERRORS):
+                logger.warning(
+                    "[APP] Se omiten las demas tareas por completar de {}: "
+                    "el endpoint no responde.", game.GAME_NAME
+                )
+                break
 
     # Paso 2: reclamar todas las completadas
     for task in finished:
@@ -597,19 +655,24 @@ async def _process_mimo_tasks(game) -> list[TaskResult]:
                 "message":   "Recompensa reclamada",
                 "detail":    task_name,
             })
-        except HoyoAPIError as e:
+        except _STEP_ERRORS as e:
             logger.warning(
-                "[APP] Error al reclamar | game={} task={!r} "
-                "retcode={} message={!r}",
-                game.GAME_NAME, task_name, e.retcode, e.message
+                "[APP] Error al reclamar | game={} task={!r} error={}",
+                game.GAME_NAME, task_name, _error_text(e)
             )
             results.append({
                 "type":      "mimo_task",
                 "game_name": game.GAME_NAME,
                 "success":   False,
-                "message":   str(e),
+                "message":   _error_text(e),
                 "detail":    task_name,
             })
+            if isinstance(e, _TRANSPORT_ERRORS):
+                logger.warning(
+                    "[APP] Se omiten las demas recompensas por reclamar de {}: "
+                    "el endpoint no responde.", game.GAME_NAME
+                )
+                break
 
     # Paso 3: reportar pendientes que requieren accion en juego
     for task in requires_game:
@@ -636,13 +699,13 @@ async def _process_mimo_buys(game) -> list[TaskResult]:
         purchases = await game.buy_mimo_currency()
     except NotImplementedError:
         return []  # Honkai o CN: sin mimo
-    except HoyoAPIError as e:
-        logger.warning("    [Mimo compra] Error: {}", e)
+    except _STEP_ERRORS as e:
+        logger.warning("    [Mimo compra] Error: {}", _error_text(e))
         return [{
             "type":      "mimo_buy",
             "game_name": game.GAME_NAME,
             "success":   False,
-            "message":   str(e),
+            "message":   _error_text(e),
             "detail":    "",
         }]
 
@@ -857,6 +920,10 @@ async def _redeem_with_token_refresh(
     que antes. Si la renovacion falla, o el reintento vuelve a fallar, se
     propaga el error — nunca hay mas de un reintento ni mas de una
     renovacion por cuenta y corrida (no se martillea al servidor).
+
+    Un fallo HTTP/de red (aiohttp.ClientError, timeout) NO se interpreta como
+    "token vencido": no dice nada del token, asi que ni renueva ni mide, y se
+    propaga tal cual a quien llama (ver _TRANSPORT_ERRORS).
     """
     try:
         await game.redeem_code(code, lang=lang)
@@ -1018,6 +1085,29 @@ async def redeem_code_for_all(
                 "success":   False,
                 "message":   msg,
             })
+        except _TRANSPORT_ERRORS as e:
+            # Fallo de infraestructura (404, 5xx, timeout), no del codigo ni
+            # de la cuenta: NO se guarda nada (ni muerto ni reclamado), el
+            # codigo sigue pendiente. ANTI-BANEO: se corta aca; si el endpoint
+            # no responde, las cuentas que faltan tampoco lo harian.
+            msg = (
+                f"Error de red/HTTP al canjear: {_transport_error_text(e)}. "
+                "No se guardo nada: el codigo sigue pendiente."
+            )
+            logger.error(
+                "[REDEEM] Error de red/HTTP en '{}' ({} uid={}): {} — se detiene "
+                "el canje para no insistir con el servidor.",
+                alias, target_game.GAME_NAME, target_game.uid,
+                _transport_error_text(e),
+            )
+            results.append({
+                "alias":     alias,
+                "game_name": target_game.GAME_NAME,
+                "uid":       target_game.uid,
+                "success":   False,
+                "message":   msg,
+            })
+            break
 
     if not found_any:
         logger.info(
@@ -1148,5 +1238,25 @@ async def redeem_pending_codes(ctx: AppContext) -> list[RedeemResult]:
                         "uid": game.uid, "success": False,
                         "message": f"{code}: {msg}",
                     })
+                except _TRANSPORT_ERRORS as e:
+                    # Fallo de infraestructura: no se guarda nada (el codigo
+                    # sigue pendiente para la proxima corrida) y se corta TODO
+                    # el canje automatico. ANTI-BANEO: no se manda el resto de
+                    # codigos, juegos ni cuentas a un servidor que no responde.
+                    reason = _transport_error_text(e)
+                    logger.error(
+                        "[REDEEM-AUTO] Error de red/HTTP en '{}' | {} | {}: {} — "
+                        "se detiene el canje automatico para no insistir.",
+                        alias, game.GAME_NAME, code, reason,
+                    )
+                    results.append({
+                        "alias": alias, "game_name": game.GAME_NAME,
+                        "uid": game.uid, "success": False,
+                        "message": (
+                            f"{code}: error de red/HTTP ({reason}). No se guardo "
+                            "nada; canje automatico detenido."
+                        ),
+                    })
+                    return results
 
     return results

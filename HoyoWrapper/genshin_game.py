@@ -4,7 +4,8 @@ HoyoWrapper/genshin_game.py
 Módulo de Genshin Impact. Solo constantes; toda la lógica está en BaseGame.
 
 Particularidades manejadas en BaseGame (GAME_ID == 2):
-  - Mimo: rutas /qiuqiu/<endpoint>, POST para claim_mimo_task_reward.
+  - Mimo: rutas /<config.MIMO_GENSHIN_PATH_PREFIX>/<endpoint> (el prefijo
+    lo rota HoYoverse; se corrige en config.py), POST para claim_mimo_task_reward.
   - Redeem: usa GET (no POST como StarRail/ZZZ).
   - x-rpc-signgame: "hk4e"
 """

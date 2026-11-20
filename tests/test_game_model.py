@@ -524,25 +524,51 @@ class TestMimoSupport:
 
 class TestMimoUrls:
 
-    def test_genshin_mimo_url_uses_nata_prefix(self, genshin: GenshinGame) -> None:
+    def test_genshin_mimo_url_uses_the_configured_prefix(self, genshin: GenshinGame) -> None:
         """
-        Genshin (GAME_ID=2) usa /nata/ en las URLs del mimo.
-        Usar la URL estandar para Genshin devuelve 404 o error de la API.
+        Genshin (GAME_ID=2) arma la URL como <base>/<prefijo>/<endpoint con
+        guiones bajos>, con el prefijo de config.MIMO_GENSHIN_PATH_PREFIX.
         Fuente: genshin.py/hoyolab.py/_request_mimo()
         """
         url = genshin._mimo_url("task-list")
-        assert "/nata/" in url, (
-            f"URL de mimo de Genshin deberia contener '/nata/'.\n"
+        expected = f"{_MIMO_BASE_URL}/{config.MIMO_GENSHIN_PATH_PREFIX}/task_list"
+        assert url == expected, (
+            f"URL de mimo de Genshin incorrecta.\n"
+            f"  Esperado: {expected!r}\n"
             f"  Obtenido: {url!r}"
         )
-        assert "/qiuqiu/" not in url, (
-            f"URL de mimo de Genshin ya no debe usar '/qiuqiu/' (obsoleto).\n"
+
+    def test_genshin_mimo_url_does_not_use_the_prefix_that_returned_404(
+        self, genshin: GenshinGame,
+    ) -> None:
+        """
+        REGRESION (20/11/2026, primer uso con una cuenta de Genshin):
+        GET .../e2023mimotravel/nata/index respondio 404. genshin.py usa
+        'nata' hasta la 1.7.21 y 'qiuqiu' desde la 1.7.22. 'nata' no debe
+        volver a quedar como prefijo por defecto.
+        """
+        url = genshin._mimo_url("index")
+        assert config.MIMO_GENSHIN_PATH_PREFIX != "nata", (
+            "config.MIMO_GENSHIN_PATH_PREFIX volvio a 'nata', el prefijo que "
+            "dio 404 en vivo. Verificar genshin.py (_request_mimo) antes de cambiarlo."
+        )
+        assert "/nata/" not in url, (
+            f"La URL del index de Genshin usa el prefijo '/nata/' (404 real).\n"
             f"  Obtenido: {url!r}"
         )
-        assert _MIMO_BASE_URL in url, (
-            f"URL de mimo debería contener la base URL.\n"
-            f"  Base: {_MIMO_BASE_URL!r}\n"
-            f"  URL:  {url!r}"
+
+    def test_genshin_mimo_prefix_is_read_from_config_at_call_time(
+        self, genshin: GenshinGame, monkeypatch,
+    ) -> None:
+        """
+        HoYoverse rota el prefijo: corregirlo debe bastar con tocar config.py,
+        sin tocar el codigo de game_model.py (y sin reiniciar nada: se lee en
+        cada llamada, no al importar el modulo).
+        """
+        monkeypatch.setattr(config, "MIMO_GENSHIN_PATH_PREFIX", "prefijo-de-prueba")
+        url = genshin._mimo_url("index")
+        assert url == f"{_MIMO_BASE_URL}/prefijo-de-prueba/index", (
+            f"El prefijo no se leyo de config en la llamada.\n  Obtenido: {url!r}"
         )
 
     def test_genshin_mimo_url_converts_hyphens(self, genshin: GenshinGame) -> None:
@@ -559,32 +585,22 @@ class TestMimoUrls:
             f"Genshin no deberia tener guiones en el endpoint.\n"
             f"  Obtenido: {url!r}"
         )
-        assert "/nata/" in url, (
-            f"Genshin deberia usar el prefijo '/nata/'.\n"
-            f"  Obtenido: {url!r}"
-        )
 
-    def test_starrail_mimo_url_no_nata(self, starrail: StarRailGame) -> None:
-        """StarRail NO usa /nata/ — usa la ruta estandar directa."""
+    def test_starrail_mimo_url_has_no_game_prefix(self, starrail: StarRailGame) -> None:
+        """StarRail NO usa el prefijo de Genshin: ruta estandar directa, con guiones."""
         url = starrail._mimo_url("task-list")
-        assert "/nata/" not in url, (
-            f"StarRail no deberia usar '/nata/' en el mimo.\n"
-            f"  Obtenido: {url!r}"
-        )
-        assert "/qiuqiu/" not in url, (
-            f"StarRail no deberia usar '/qiuqiu/' en el mimo.\n"
+        assert url == f"{_MIMO_BASE_URL}/task-list", (
+            f"URL de mimo de StarRail incorrecta.\n"
+            f"  Esperado: {_MIMO_BASE_URL}/task-list\n"
             f"  Obtenido: {url!r}"
         )
 
-    def test_zzz_mimo_url_no_nata(self, zzz: ZZZGame) -> None:
-        """ZZZ NO usa /nata/ — usa la ruta estandar directa."""
+    def test_zzz_mimo_url_has_no_game_prefix(self, zzz: ZZZGame) -> None:
+        """ZZZ NO usa el prefijo de Genshin: ruta estandar directa, con guiones."""
         url = zzz._mimo_url("exchange-list")
-        assert "/nata/" not in url, (
-            f"ZZZ no deberia usar '/nata/' en el mimo.\n"
-            f"  Obtenido: {url!r}"
-        )
-        assert "/qiuqiu/" not in url, (
-            f"ZZZ no deberia usar '/qiuqiu/' en el mimo.\n"
+        assert url == f"{_MIMO_BASE_URL}/exchange-list", (
+            f"URL de mimo de ZZZ incorrecta.\n"
+            f"  Esperado: {_MIMO_BASE_URL}/exchange-list\n"
             f"  Obtenido: {url!r}"
         )
 
