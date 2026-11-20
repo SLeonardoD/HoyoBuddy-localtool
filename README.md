@@ -309,7 +309,7 @@ El programa crea/usa un archivo SQLite (por defecto `./hoyo_auth.db`, configurab
 pytest
 ```
 
-336 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
+350 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
 
 1. Un test verifica una regla de negocio, no un detalle de implementación.
 2. Los mensajes de assert explican qué se esperaba, qué se obtuvo, y por qué importa.
