@@ -237,7 +237,7 @@ El canje de códigos exige una cookie, `cookie_token_v2`, que **caduca**. Check-
 
 Si HoYoverse responde que ya envió un código hace poco (`-3206`), no es un error: hay que usar ese código. Después del primer login el `device_id` se conserva y no se vuelve a pedir.
 
-**La contraseña solo vuelve a hacer falta** para cuentas registradas con el login web antiguo, o si el propio `stoken` deja de servir (caso excepcional; el aviso lo señala). Reingresarla puede abrir el captcha y, si HoYoverse lo considera un dispositivo nuevo, pedir un código por email. En ese caso la consola te pide el código: lo escribís y se lo manda a HoYoverse (hasta 3 intentos si lo escribís mal); `r` pide que lo reenvíe (una sola vez, con un captcha nuevo) y Enter vacío cancela. Si HoYoverse responde que ya envió un código hace poco (`-3206`), no es un error: usá el más reciente de tu correo. El `device_id` se conserva entre logins de la misma cuenta justamente para evitarlo.
+**La contraseña solo vuelve a hacer falta** para cuentas registradas con el login web antiguo, o si el propio `stoken` deja de servir (caso excepcional; el aviso lo señala). En ese caso se repite el flujo de arriba: captcha y, si HoYoverse lo considera un dispositivo nuevo, código por email. El `device_id` se conserva entre logins de la misma cuenta justamente para evitarlo.
 
 ### Medición de la vida útil del token
 
