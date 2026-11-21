@@ -51,6 +51,9 @@ __all__ = [
     "redeem_pending_codes",
     "get_token_report",
     "REDEEMABLE_GAMES",
+    "GameSelector",
+    "parse_index_selection",
+    "describe_game",
     "TaskResult",
     "AccountResult",
     "DailyRunResult",
@@ -357,9 +360,69 @@ async def restore_session(
 # Tareas diarias
 # ---------------------------------------------------------------------------
 
-async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
+# Callback para elegir, por cuenta, que juegos ejecutar. Se invoca UNA vez por
+# cuenta, con su alias y los juegos detectados (ya con la sesion restaurada),
+# y devuelve los juegos a ejecutar. None o lista vacia = omitir la cuenta.
+GameSelector = typing.Callable[
+    [str, list], typing.Awaitable[typing.Optional[list]]
+]
+
+
+def parse_index_selection(text: str, count: int) -> typing.Optional[list[int]]:
     """
-    Ejecuta las tareas diarias en todas las cuentas registradas.
+    Interpreta una seleccion de opciones numeradas (1..count) escrita por el
+    usuario: "1,3", "1 3", "1-3" o combinaciones ("1, 3-4").
+
+    Devuelve los indices base 0, ordenados y sin repetir. "0" devuelve [] (el
+    usuario eligio "ninguna / cancelar"). Devuelve None si el texto esta vacio
+    o no es valido (no numerico, fuera de 1..count, rango invertido, "0"
+    mezclado con otros numeros): quien llama decide si vuelve a preguntar.
+    """
+    cleaned = text.strip().replace(",", " ")
+    if not cleaned:
+        return None
+    if cleaned == "0":
+        return []
+
+    picked: set[int] = set()
+    for token in cleaned.split():
+        first, dash, last = token.partition("-")
+        if dash:
+            bounds = (first, last)
+        else:
+            bounds = (first, first)
+        if not all(b.isascii() and b.isdigit() for b in bounds):
+            return None
+        start, end = int(bounds[0]), int(bounds[1])
+        if start < 1 or end > count or start > end:
+            return None
+        picked.update(n - 1 for n in range(start, end + 1))
+    return sorted(picked)
+
+
+def describe_game(game) -> str:
+    """Etiqueta para elegir un juego: nombre, personaje, UID y servidor."""
+    label = f"{game.GAME_NAME} - {game.nickname}" if game.nickname else game.GAME_NAME
+    return f"{label} (UID {game.uid}, {game.server_name or game.server})"
+
+
+async def run_daily_tasks(
+    ctx: AppContext,
+    *,
+    aliases: typing.Optional[typing.Collection[str]] = None,
+    select_games: typing.Optional[GameSelector] = None,
+) -> DailyRunResult:
+    """
+    Ejecuta las tareas diarias en las cuentas registradas.
+
+    Por defecto (sin argumentos): todas las cuentas y todos sus juegos.
+    Opcionales:
+      aliases       procesa SOLO esas cuentas (en el orden del registro).
+                    Los alias que no existan se ignoran con un aviso.
+      select_games  callback (ver GameSelector) para elegir, por cuenta, que
+                    juegos ejecutar. Se invoca tras restaurar la sesion y ANTES
+                    de renovar el token: si no queda ningun juego, la cuenta se
+                    omite sin mas requests.
 
     Por cada cuenta:
       1. Restaurar sesion (si falla, se reporta y se continua con la siguiente).
@@ -380,6 +443,16 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
     if not accounts:
         logger.info("No hay cuentas registradas. Usa 'Agregar cuenta' primero.")
         return {"accounts": []}
+
+    if aliases is not None:
+        wanted = set(aliases)
+        accounts = [a for a in accounts if a["alias"] in wanted]
+        unknown = wanted - {a["alias"] for a in accounts}
+        if unknown:
+            logger.warning("Cuentas no encontradas (se ignoran): {}", sorted(unknown))
+        if not accounts:
+            logger.info("Ninguna de las cuentas pedidas existe: no hay nada que procesar.")
+            return {"accounts": []}
 
     results: list[AccountResult] = []
 
@@ -424,6 +497,24 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
             })
             continue
 
+        # Seleccion de juegos (opcional). Va antes de renovar el token: si el
+        # usuario omite la cuenta no se hace ninguna request mas con ella.
+        games = active.games
+        if select_games is not None:
+            chosen = await select_games(alias, list(active.games))
+            games = [g for g in active.games if chosen and g in chosen]
+            if not games:
+                logger.info("  '{}': sin juegos seleccionados, se omite la cuenta.", alias)
+                results.append({
+                    "alias":   alias,
+                    "region":  account["region"],
+                    "success": True,
+                    "message": "Sin juegos seleccionados para esta cuenta.",
+                    "tasks":   [],
+                    "warnings": [],
+                })
+                continue
+
         # Renovar cookie_token_v2 ANTES de las tareas: asi el canje de
         # codigos nunca se encuentra con un token vencido, aunque hoy no
         # haya codigos que canjear (ver docstring). _renew_account_token
@@ -440,7 +531,7 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
         # (que se salta para la primera), este se aplica siempre.
         await random_delay(*config.DELAY_AFTER_SESSION_RESTORE)
 
-        task_results = await _process_account_games(active, alias)
+        task_results = await _process_account_games(active, alias, games)
 
         results.append({
             "alias":   alias,
@@ -457,14 +548,17 @@ async def run_daily_tasks(ctx: AppContext) -> DailyRunResult:
 async def _process_account_games(
     active: ActiveSession,
     alias: str,
+    games: typing.Optional[list] = None,
 ) -> list[TaskResult]:
     """
-    Ejecuta check-in, mimo tasks y compra de moneda para todos los juegos
-    de una sesion activa.
+    Ejecuta check-in, mimo tasks y compra de moneda para los juegos de una
+    sesion activa: todos los detectados, o solo `games` si se indica.
     """
     tasks: list[TaskResult] = []
+    if games is None:
+        games = active.games
 
-    for j, game in enumerate(active.games):
+    for j, game in enumerate(games):
         if j > 0:
             await random_delay(*config.DELAY_BETWEEN_GAMES)
 

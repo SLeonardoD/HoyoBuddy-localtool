@@ -33,7 +33,9 @@ from app import (
     _process_mimo_buys,
     _redeem_with_token_refresh,
     _transport_error_text,
+    describe_game,
     get_token_report,
+    parse_index_selection,
 )
 import config
 from db.store import AccountStore, GiftCodeStore
@@ -1687,3 +1689,304 @@ class TestHttpErrorsDuringRedeem:
             )
         statuses = {c["code"]: c["status"] for c in ctx.code_store.list_codes("hk4e_global")}
         assert statuses == {"CODIGO1": "active", "CODIGO2": "active"}, f"Estados: {statuses}"
+
+
+# ---------------------------------------------------------------------------
+# Seleccion de cuentas y juegos para las tareas diarias
+# ---------------------------------------------------------------------------
+
+class TestParseIndexSelection:
+
+    @pytest.mark.parametrize("text, count, expected", [
+        ("1",        3, [0]),
+        ("1,3",      3, [0, 2]),
+        ("1 3",      3, [0, 2]),
+        ("1, 3",     3, [0, 2]),
+        ("1-3",      3, [0, 1, 2]),
+        ("1, 3-4",   5, [0, 2, 3]),
+        ("3,1",      3, [0, 2]),     # orden de entrada irrelevante: sale ordenado
+        ("2,2,2",    3, [1]),        # sin repetidos
+        ("  2  ",    3, [1]),
+        ("0",        3, []),         # "ninguna / cancelar"
+    ])
+    def test_valid_selections(self, text: str, count: int, expected: list[int]) -> None:
+        assert parse_index_selection(text, count) == expected, (
+            f"{text!r} con {count} opciones debia dar {expected}."
+        )
+
+    @pytest.mark.parametrize("text", [
+        "",          # vacio: quien llama decide que significa
+        "   ",
+        "4",         # fuera de rango (hay 3)
+        "-1",
+        "1-4",       # rango que se sale
+        "3-1",       # rango invertido
+        "a",
+        "1,a",
+        "1-",
+        "-3",
+        "1-2-3",
+        "0,1",       # "0" no se mezcla con otros numeros
+        "1.5",
+        "\u00b2",   # digito unicode que int() no acepta
+    ])
+    def test_invalid_selections_return_none(self, text: str) -> None:
+        assert parse_index_selection(text, 3) is None, (
+            f"{text!r} no es una seleccion valida de 3 opciones y debe dar None."
+        )
+
+    def test_huge_range_is_rejected_without_iterating_it(self) -> None:
+        """'1-999999999' se descarta por limites, no recorriendo el rango."""
+        assert parse_index_selection("1-999999999", 3) is None
+
+
+class TestDescribeGame:
+
+    def test_includes_name_nickname_uid_and_server(self) -> None:
+        game = MagicMock(GAME_NAME="Genshin Impact", nickname="Viajero", uid="700000001",
+                         server_name="America", server="os_usa")
+        assert describe_game(game) == "Genshin Impact - Viajero (UID 700000001, America)"
+
+    def test_falls_back_to_server_code_and_omits_empty_nickname(self) -> None:
+        game = MagicMock(GAME_NAME="Honkai: Star Rail", nickname="", uid="800000001",
+                         server_name="", server="prod_official_usa")
+        assert describe_game(game) == "Honkai: Star Rail (UID 800000001, prod_official_usa)"
+
+
+def _two_games() -> tuple[MagicMock, MagicMock]:
+    return (
+        _daily_game("Genshin Impact", "hk4e_global", uid="1"),
+        _daily_game("Honkai: Star Rail", "hkrpg_global", uid="2"),
+    )
+
+
+async def _run_daily_multi(
+    ctx: AppContext,
+    games_by_alias: dict[str, list],
+    **kwargs,
+) -> tuple[dict, AsyncMock, AsyncMock]:
+    """
+    Registra una cuenta por alias (en ese orden) y corre run_daily_tasks.
+    Devuelve (resultado, mock de restore_session, mock de random_delay).
+    """
+    for alias in games_by_alias:
+        _seed_account(ctx.account_store, alias, f"{alias.lower()}@example.com")
+    actives = {}
+    for alias, games in games_by_alias.items():
+        active = MagicMock(spec=ActiveSession)
+        active.games = games
+        actives[alias] = active
+
+    async def fake_restore(ctx_, account):
+        return actives[account["alias"]]
+
+    restore = AsyncMock(side_effect=fake_restore)
+    delay = AsyncMock()
+    with patch("app.restore_session", new=restore), patch("app.random_delay", new=delay):
+        result = await run_daily_tasks(ctx, **kwargs)
+    return result, restore, delay
+
+
+def _delays_of(delay_mock: AsyncMock, which: tuple) -> int:
+    return sum(1 for c in delay_mock.call_args_list if c.args == which)
+
+
+class TestDailyTasksAccountSelection:
+
+    @pytest.mark.asyncio
+    async def test_without_arguments_every_account_is_processed(self, ctx: AppContext) -> None:
+        """Preservacion: el comportamiento de siempre (todo) no cambia."""
+        result, restore, _ = await _run_daily_multi(ctx, {
+            "Alice": [_daily_game()], "Bob": [_daily_game()], "Carol": [_daily_game()],
+        })
+        assert [a["alias"] for a in result["accounts"]] == ["Alice", "Bob", "Carol"]
+        assert restore.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_only_the_chosen_accounts_are_restored_and_processed(self, ctx: AppContext) -> None:
+        g_alice, g_bob, g_carol = _daily_game(), _daily_game(), _daily_game()
+        result, restore, _ = await _run_daily_multi(
+            ctx, {"Alice": [g_alice], "Bob": [g_bob], "Carol": [g_carol]}, aliases=["Bob"],
+        )
+        assert [a["alias"] for a in result["accounts"]] == ["Bob"]
+        assert restore.await_count == 1, (
+            "Una cuenta no elegida no debe ni restaurar sesion (cada restore son requests)."
+        )
+        g_bob.claim_daily_reward.assert_awaited_once()
+        g_alice.claim_daily_reward.assert_not_awaited()
+        g_carol.claim_daily_reward.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_chosen_accounts_keep_registry_order_and_delay_applies_between_them(
+        self, ctx: AppContext,
+    ) -> None:
+        result, _, delay = await _run_daily_multi(ctx, {
+            "Alice": [_daily_game()], "Bob": [_daily_game()], "Carol": [_daily_game()],
+        }, aliases=["Carol", "Alice"])   # el orden pedido no importa
+        assert [a["alias"] for a in result["accounts"]] == ["Alice", "Carol"]
+        assert _delays_of(delay, config.DELAY_BETWEEN_ACCOUNTS) == 1, (
+            "Con 2 cuentas elegidas hay UNA pausa entre ellas (anti-deteccion), "
+            "no una por cuenta registrada."
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_aliases_are_ignored(self, ctx: AppContext) -> None:
+        result, restore, _ = await _run_daily_multi(
+            ctx, {"Alice": [_daily_game()]}, aliases=["Alice", "NoExiste"],
+        )
+        assert [a["alias"] for a in result["accounts"]] == ["Alice"]
+        assert restore.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_matching_account_means_nothing_to_do(self, ctx: AppContext) -> None:
+        result, restore, _ = await _run_daily_multi(
+            ctx, {"Alice": [_daily_game()]}, aliases=["NoExiste"],
+        )
+        assert result == {"accounts": []}
+        restore.assert_not_awaited()
+
+
+class TestDailyTasksGameSelection:
+
+    @pytest.mark.asyncio
+    async def test_callback_receives_alias_and_detected_games(self, ctx: AppContext) -> None:
+        g1, g2 = _two_games()
+        seen: list[tuple] = []
+
+        async def chooser(alias, games):
+            seen.append((alias, list(games)))
+            return games
+
+        await _run_daily_multi(ctx, {"Alice": [g1, g2]}, select_games=chooser)
+
+        assert seen == [("Alice", [g1, g2])]
+
+    @pytest.mark.asyncio
+    async def test_only_the_chosen_games_are_processed(self, ctx: AppContext) -> None:
+        g1, g2 = _two_games()
+        g3 = _daily_game("Zenless Zone Zero", "nap_global", uid="3")
+
+        async def chooser(alias, games):
+            return [games[0], games[2]]   # Genshin y ZZZ; HSR no
+
+        result, _, delay = await _run_daily_multi(ctx, {"Alice": [g1, g2, g3]}, select_games=chooser)
+
+        g1.claim_daily_reward.assert_awaited_once()
+        g3.claim_daily_reward.assert_awaited_once()
+        g2.claim_daily_reward.assert_not_awaited()
+        g2.get_mimo_tasks.assert_not_awaited()
+        g2.buy_mimo_currency.assert_not_awaited()
+        names = {t["game_name"] for t in result["accounts"][0]["tasks"]}
+        assert names == {"Genshin Impact", "Zenless Zone Zero"}
+        assert _delays_of(delay, config.DELAY_BETWEEN_GAMES) == 1, (
+            "La pausa entre juegos se cuenta sobre los juegos ELEGIDOS (2 -> 1 pausa), "
+            "no sobre los detectados."
+        )
+
+    @pytest.mark.asyncio
+    async def test_games_run_in_detection_order_whatever_the_callback_returns(
+        self, ctx: AppContext,
+    ) -> None:
+        g1, g2 = _two_games()
+        order: list[str] = []
+        g1.claim_daily_reward = AsyncMock(side_effect=lambda **k: order.append("g1") or {
+            "message": "ok", "already_done": True, "total_sign_day": 1})
+        g2.claim_daily_reward = AsyncMock(side_effect=lambda **k: order.append("g2") or {
+            "message": "ok", "already_done": True, "total_sign_day": 1})
+
+        async def chooser(alias, games):
+            return [games[1], games[0]]   # al reves
+
+        await _run_daily_multi(ctx, {"Alice": [g1, g2]}, select_games=chooser)
+
+        assert order == ["g1", "g2"]
+
+    @pytest.mark.parametrize("answer", [[], None])
+    @pytest.mark.asyncio
+    async def test_no_games_chosen_skips_the_account_without_renewing_or_running(
+        self, ctx: AppContext, answer,
+    ) -> None:
+        g1, _ = _two_games()
+
+        async def chooser(alias, games):
+            return answer
+
+        result, _, _ = await _run_daily_multi(ctx, {"Alice": [g1]}, select_games=chooser)
+
+        account = result["accounts"][0]
+        assert account["success"] is True and account["tasks"] == []
+        assert account["message"] == "Sin juegos seleccionados para esta cuenta."
+        g1.claim_daily_reward.assert_not_awaited()
+        ctx.manager.renew_cookie_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skipped_account_does_not_stop_the_next_one(self, ctx: AppContext) -> None:
+        g_alice = _daily_game()
+        g_bob = _daily_game()
+
+        async def chooser(alias, games):
+            return [] if alias == "Alice" else games
+
+        result, _, _ = await _run_daily_multi(
+            ctx, {"Alice": [g_alice], "Bob": [g_bob]}, select_games=chooser,
+        )
+
+        assert [a["tasks"] != [] for a in result["accounts"]] == [False, True]
+        g_alice.claim_daily_reward.assert_not_awaited()
+        g_bob.claim_daily_reward.assert_awaited_once()
+        assert ctx.manager.renew_cookie_token.await_count == 1, (
+            "El token se renueva solo para la cuenta que si corre."
+        )
+
+    @pytest.mark.asyncio
+    async def test_games_not_belonging_to_the_account_are_ignored(self, ctx: AppContext) -> None:
+        g1, _ = _two_games()
+        stranger = _daily_game("Ajeno", "otro", uid="9")
+
+        async def chooser(alias, games):
+            return [stranger]
+
+        result, _, _ = await _run_daily_multi(ctx, {"Alice": [g1]}, select_games=chooser)
+
+        stranger.claim_daily_reward.assert_not_awaited()
+        g1.claim_daily_reward.assert_not_awaited()
+        assert result["accounts"][0]["tasks"] == []
+
+    @pytest.mark.asyncio
+    async def test_callback_is_not_called_when_the_session_cannot_be_restored(
+        self, ctx: AppContext,
+    ) -> None:
+        _seed_account(ctx.account_store, ALIAS_1, EMAIL_1)
+        chooser = AsyncMock(return_value=[])
+        with patch("app.restore_session", new=AsyncMock(return_value=None)):
+            with patch("app.random_delay", new=AsyncMock()):
+                result = await run_daily_tasks(ctx, select_games=chooser)
+
+        chooser.assert_not_awaited()
+        assert result["accounts"][0]["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_callback_is_not_called_for_an_account_without_games(self, ctx: AppContext) -> None:
+        chooser = AsyncMock(return_value=[])
+        await _run_daily_multi(ctx, {"Alice": []}, select_games=chooser)
+        chooser.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_account_and_game_selection_work_together(self, ctx: AppContext) -> None:
+        g_alice_1, g_alice_2 = _two_games()
+        g_bob_1, g_bob_2 = _two_games()
+
+        async def chooser(alias, games):
+            return [games[1]]   # solo el 2.o juego de cada cuenta elegida
+
+        result, _, _ = await _run_daily_multi(
+            ctx,
+            {"Alice": [g_alice_1, g_alice_2], "Bob": [g_bob_1, g_bob_2], "Carol": [_daily_game()]},
+            aliases=["Alice", "Bob"], select_games=chooser,
+        )
+
+        assert [a["alias"] for a in result["accounts"]] == ["Alice", "Bob"]
+        g_alice_2.claim_daily_reward.assert_awaited_once()
+        g_bob_2.claim_daily_reward.assert_awaited_once()
+        g_alice_1.claim_daily_reward.assert_not_awaited()
+        g_bob_1.claim_daily_reward.assert_not_awaited()

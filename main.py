@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import typing
 from datetime import datetime
 
 from loguru import logger
@@ -38,6 +39,8 @@ from app import (
     redeem_pending_codes,
     get_token_report,
     REDEEMABLE_GAMES,
+    parse_index_selection,
+    describe_game,
 )
 
 # ---------------------------------------------------------------------------
@@ -117,6 +120,19 @@ def _ask_password(prompt: str = "Contrasena: ") -> str:
     except (KeyboardInterrupt, Exception):
         print("\n  Operacion cancelada.")
         return ""
+
+
+def _ask_choice(prompt: str) -> typing.Optional[str]:
+    """
+    Input para elegir opciones. Igual que _ask, pero Ctrl+C / fin de entrada
+    devuelven None en vez de "": en una seleccion, "" significa "todas" y una
+    cancelacion jamas debe confundirse con eso.
+    """
+    try:
+        return input(f"  {prompt}").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Seleccion cancelada.")
+        return None
 
 
 def _confirm(prompt: str) -> bool:
@@ -227,8 +243,46 @@ async def _action_delete_account(ctx: AppContext) -> None:
         logger.error("Error: {}", result["message"])
 
 
+def _pick_accounts(accounts: list[dict]) -> list[str]:
+    """
+    Pide que cuentas procesar (numeros: "1,3", "1-3"). Devuelve sus alias, o
+    [] si el usuario cancela ("0" o Ctrl+C).
+    """
+    while True:
+        raw = _ask_choice("Cuentas [numeros: 1,3 o 1-3 | 0 = cancelar]: ")
+        if raw is None:
+            return []
+        picks = parse_index_selection(raw, len(accounts))
+        if picks is None:
+            print(f"  Seleccion no valida. Usa numeros entre 1 y {len(accounts)}.")
+            continue
+        return [accounts[i]["alias"] for i in picks]
+
+
+async def _choose_games_prompt(alias: str, games: list) -> list:
+    """
+    Callback de run_daily_tasks: pregunta, para una cuenta ya restaurada, que
+    juegos ejecutar. Enter = todos; "0" o Ctrl+C = omitir la cuenta.
+    """
+    print(f"\n  Cuenta '{alias}' - juegos detectados:")
+    for n, game in enumerate(games, 1):
+        print(f"    {n}. {describe_game(game)}")
+
+    while True:
+        raw = _ask_choice("Juegos [Enter = todos | numeros: 1,3 | 0 = omitir cuenta]: ")
+        if raw is None:
+            return []
+        if raw == "":
+            return list(games)
+        picks = parse_index_selection(raw, len(games))
+        if picks is None:
+            print(f"  Seleccion no valida. Usa numeros entre 1 y {len(games)}.")
+            continue
+        return [games[i] for i in picks]
+
+
 async def _action_run_daily(ctx: AppContext) -> None:
-    """Ejecuta las tareas diarias en todas las cuentas."""
+    """Ejecuta las tareas diarias: en todo, o solo en las cuentas y juegos elegidos."""
     print(f"\n{SEP_FAT}")
     print("  COMPLETAR TAREAS DIARIAS")
     print(SEP_FAT)
@@ -239,9 +293,34 @@ async def _action_run_daily(ctx: AppContext) -> None:
         print("  Usa la opcion 1 para agregar una cuenta primero.")
         return
 
-    print(f"\n  Cuentas a procesar: {len(accounts)}")
-    for acc in accounts:
-        print(f"    - {acc['alias']} [{acc['region'].upper()}]")
+    print(f"\n  Cuentas registradas: {len(accounts)}")
+    for n, acc in enumerate(accounts, 1):
+        print(f"    {n}. {acc['alias']} [{acc['region'].upper()}]")
+
+    # Enter = comportamiento de siempre (todo). "e" permite elegir.
+    print()
+    while True:
+        mode = _ask_choice("Ejecutar en [Enter = todas las cuentas y juegos | e = elegir]: ")
+        if mode is None:
+            print("  Cancelado.")
+            return
+        mode = mode.lower()
+        if mode in ("", "e"):
+            break
+        print("  Opcion no valida. Pulsa Enter o escribe 'e'.")
+
+    aliases: typing.Optional[list[str]] = None
+    chooser = None
+    if mode == "e":
+        aliases = _pick_accounts(accounts)
+        if not aliases:
+            print("  Cancelado.")
+            return
+        chooser = _choose_games_prompt
+        print(f"\n  Cuentas elegidas: {', '.join(aliases)}")
+        print("  Los juegos de cada cuenta se eligen cuando le toque su turno.")
+    else:
+        print(f"\n  Se procesaran las {len(accounts)} cuentas con todos sus juegos.")
 
     print()
     if not _confirm("Iniciar tareas diarias"):
@@ -249,7 +328,7 @@ async def _action_run_daily(ctx: AppContext) -> None:
         return
 
     print()
-    result = await run_daily_tasks(ctx)
+    result = await run_daily_tasks(ctx, aliases=aliases, select_games=chooser)
 
     # Imprimir resumen final
     _print_daily_summary(result)
@@ -281,7 +360,12 @@ def _print_daily_summary(result: dict) -> None:
             print(f"    [!] {warning}")
 
         if not tasks:
-            print(f"    Sin juegos soportados vinculados a esta cuenta.")
+            # "OK" es el mensaje de una cuenta con tareas; sin tareas, el mensaje
+            # dice por que (sin juegos vinculados, o sin juegos elegidos).
+            message = acc_result.get("message")
+            if not message or message == "OK":
+                message = "Sin juegos soportados vinculados a esta cuenta."
+            print(f"    {message}")
             continue
 
         # Agrupar por juego

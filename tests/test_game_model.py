@@ -605,6 +605,84 @@ class TestMimoUrls:
         )
 
 
+class TestMimoLang:
+    """
+    REGRESION (20/11/2026): con el prefijo ya corregido, task_list y
+    exchange_list de Genshin respondieron -510001 "Parameter Error". La unica
+    diferencia de parametros con genshin.py era lang ("en" vs "en-us", que
+    genshin.py envia en todas sus requests del Mimo). HSR y ZZZ estan
+    validados en vivo con "en" y no deben cambiar.
+    """
+
+    @staticmethod
+    def _recorder(game, mimo_game_id: int):
+        """Reemplaza session.request y devuelve la lista de (url, params/body) enviados."""
+        sent: list[tuple[str, dict]] = []
+
+        async def mock_request(method: str, url: str, **kwargs):
+            sent.append((url, kwargs.get("params") or kwargs.get("body") or {}))
+            if "index" in url:
+                if mimo_game_id == 2:
+                    return {"act_list": [{"act_info": {"game_id": 2, "version_id": 72}}]}
+                return {"list": [{"game_id": mimo_game_id, "version_id": 7}]}
+            return {"task_list": [], "exchange_award_list": []}
+
+        game.session.request = mock_request  # type: ignore[method-assign]
+        return sent
+
+    def test_genshin_default_mimo_lang_comes_from_config_and_is_not_plain_en(
+        self, genshin: GenshinGame,
+    ) -> None:
+        assert genshin._mimo_lang() == config.MIMO_GENSHIN_LANG
+        assert config.MIMO_GENSHIN_LANG != "en", (
+            "config.MIMO_GENSHIN_LANG volvio a 'en': con ese valor task_list y "
+            "exchange_list de Genshin dieron -510001 en vivo. genshin.py usa 'en-us'."
+        )
+
+    def test_other_games_keep_the_validated_lang(
+        self, starrail: StarRailGame, zzz: ZZZGame,
+    ) -> None:
+        assert starrail._mimo_lang() == config.MIMO_LANG
+        assert zzz._mimo_lang() == config.MIMO_LANG
+        assert config.MIMO_LANG == "en", "HSR/ZZZ se validaron en vivo con lang='en'."
+
+    def test_explicit_lang_wins_over_the_default(self, genshin: GenshinGame) -> None:
+        assert genshin._mimo_lang("es-es") == "es-es"
+
+    @pytest.mark.asyncio
+    async def test_every_genshin_mimo_request_sends_the_genshin_lang(
+        self, genshin: GenshinGame,
+    ) -> None:
+        sent = self._recorder(genshin, mimo_game_id=2)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await genshin.get_mimo_tasks()
+            await genshin.get_mimo_shop_items()
+            await genshin.finish_mimo_task(1)
+            await genshin.claim_mimo_task_reward(1)
+
+        endpoints = [u.rsplit("/", 1)[-1] for u, _ in sent]
+        assert endpoints == ["index", "task_list", "exchange_list", "finish_task", "receive_point"], (
+            f"Se esperaban las 5 requests del flujo. Obtenidas: {endpoints}"
+        )
+        langs = {u.rsplit("/", 1)[-1]: p.get("lang") for u, p in sent}
+        assert set(langs.values()) == {config.MIMO_GENSHIN_LANG}, (
+            f"Toda request del Mimo de Genshin debe llevar lang={config.MIMO_GENSHIN_LANG!r}. "
+            f"Enviado: {langs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_starrail_mimo_requests_keep_lang_en(self, starrail: StarRailGame) -> None:
+        sent = self._recorder(starrail, mimo_game_id=6)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await starrail.get_mimo_tasks()
+            await starrail.get_mimo_shop_items()
+
+        langs = {p.get("lang") for _, p in sent}
+        assert langs == {config.MIMO_LANG}, f"HSR no debe cambiar de idioma. Enviado: {langs}"
+
+
 # ---------------------------------------------------------------------------
 # Tests de create_game (factory)
 # ---------------------------------------------------------------------------

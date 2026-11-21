@@ -323,6 +323,17 @@ MIMO_BASE_URL = "https://sg-public-api.hoyolab.com/event/e2023mimotravel"
 # leer _request_mimo y corregir SOLO este valor. HSR y ZZZ no usan prefijo.
 MIMO_GENSHIN_PATH_PREFIX = "qiuqiu"
 
+# Idioma (parametro "lang") de las requests del Mimo de Genshin (GAME_ID 2).
+# genshin.py envia "en-us" en TODAS sus requests del Mimo (Client(lang="en-us")
+# por defecto) y es lo unico, junto al prefijo, que las nuestras hacian distinto:
+# con "en", task_list y exchange_list de Genshin respondieron -510001
+# "Parameter Error" el 20/11/2026 (el index si respondia). HSR y ZZZ se
+# validaron en vivo con "en" y no se tocan: ver MIMO_LANG.
+MIMO_GENSHIN_LANG = "en-us"
+
+# Idioma de las requests del Mimo de los demas juegos (HSR, ZZZ).
+MIMO_LANG = "en"
+
 # Tipos de tarea mimo completables via finish_mimo_task() (no requieren
 # accion real dentro del juego). NO incluir GI_LOGIN(5), GI_GAME(6),
 # HSR_GAME(8), ZZZ_DAILY_LOGIN(12), ZZZ_CONSECUTIVE_LOGIN(13), ZZZ_GAME(16)

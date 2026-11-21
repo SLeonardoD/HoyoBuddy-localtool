@@ -359,6 +359,16 @@ class BaseGame:
             return f"{_MIMO_BASE_URL}/{prefix}/{endpoint.replace('-', '_')}"
         return f"{_MIMO_BASE_URL}/{endpoint}"
 
+    def _mimo_lang(self, lang: typing.Optional[str] = None) -> str:
+        """
+        Idioma de las requests del Mimo. Un `lang` explicito manda; si no,
+        Genshin (GAME_ID=2) usa config.MIMO_GENSHIN_LANG ("en-us", como
+        genshin.py) y el resto config.MIMO_LANG ("en", validado en vivo).
+        """
+        if lang is not None:
+            return lang
+        return config.MIMO_GENSHIN_LANG if self.GAME_ID == 2 else config.MIMO_LANG
+
     async def _get_mimo_version_id(self) -> int:
         """Obtiene el version_id activo del mimo. Cacheado por instancia."""
         if self._mimo_version_id is not None:
@@ -373,7 +383,7 @@ class BaseGame:
         try:
             data = await self._get(
                 url,
-                params={"game_id": self.GAME_ID, "lang": "en"},
+                params={"game_id": self.GAME_ID, "lang": self._mimo_lang()},
             )
             logger.debug(
                 "[MIMO] index response | game={} data_keys={}",
@@ -410,6 +420,10 @@ class BaseGame:
              if i.get("game_id") == self.GAME_ID or i.get("game") == self.GAME_ID),
             items[0],
         )
+        logger.debug(
+            "[MIMO] entrada del index elegida | game={} entry={}",
+            self.GAME_NAME, entry
+        )
         if entry is items[0] and len(items) > 1:
             logger.debug(
                 "[MIMO] Sin coincidencia exacta game_id={}, usando primer item: {}",
@@ -438,9 +452,10 @@ class BaseGame:
         await random_delay(*config.DELAY_MIMO_VERSION_TO_ACTION)
         return self._mimo_version_id
 
-    async def get_mimo_tasks(self, *, lang: str = "en") -> list[dict]:
+    async def get_mimo_tasks(self, *, lang: typing.Optional[str] = None) -> list[dict]:
         """Lista de tareas del mimo viajero."""
         self._check_mimo_support()
+        lang = self._mimo_lang(lang)
         version_id = await self._get_mimo_version_id()
         url = self._mimo_url("task-list")
         params = {"game_id": self.GAME_ID, "lang": lang, "version_id": version_id}
@@ -472,12 +487,13 @@ class BaseGame:
             return tasks
         except HoyoAPIError as e:
             logger.error(
-                "[MIMO] Error en task-list | game={} retcode={} message={!r} raw={}",
-                self.GAME_NAME, e.retcode, e.message, e.raw
+                "[MIMO] Error en task-list | game={} retcode={} message={!r} "
+                "raw={} params={}",
+                self.GAME_NAME, e.retcode, e.message, e.raw, params
             )
             raise
 
-    async def finish_mimo_task(self, task_id: int, *, lang: str = "en") -> None:
+    async def finish_mimo_task(self, task_id: int, *, lang: typing.Optional[str] = None) -> None:
         """
         Completa una tarea mimo via API (tareas tipo VISIT, VIEW_TOPIC, TRAILER, etc.).
 
@@ -489,6 +505,7 @@ class BaseGame:
         Fuente: genshin.py/hoyolab.py/finish_mimo_task() — usa POST con body.
         """
         self._check_mimo_support()
+        lang = self._mimo_lang(lang)
         version_id = await self._get_mimo_version_id()
         url = self._mimo_url("finish-task")
         body = {
@@ -517,13 +534,14 @@ class BaseGame:
             )
             raise
 
-    async def claim_mimo_task_reward(self, task_id: int, *, lang: str = "en") -> None:
+    async def claim_mimo_task_reward(self, task_id: int, *, lang: typing.Optional[str] = None) -> None:
         """
         Reclama la recompensa de una tarea mimo completada.
         Genshin (GAME_ID=2) usa POST; resto usa GET.
         Fuente: genshin.py/hoyolab.py/claim_mimo_task_reward()
         """
         self._check_mimo_support()
+        lang = self._mimo_lang(lang)
         version_id = await self._get_mimo_version_id()
         url = self._mimo_url("receive-point")
         params = {
@@ -558,9 +576,10 @@ class BaseGame:
             )
             raise
 
-    async def get_mimo_shop_items(self, *, lang: str = "en") -> list[dict]:
+    async def get_mimo_shop_items(self, *, lang: typing.Optional[str] = None) -> list[dict]:
         """Items disponibles en la tienda mimo."""
         self._check_mimo_support()
+        lang = self._mimo_lang(lang)
         version_id = await self._get_mimo_version_id()
         url = self._mimo_url("exchange-list")
         params = {"game_id": self.GAME_ID, "lang": lang, "version_id": version_id}
@@ -589,17 +608,18 @@ class BaseGame:
         except HoyoAPIError as e:
             logger.error(
                 "[MIMO] Error en exchange-list | game={} "
-                "retcode={} message={!r} raw={}",
-                self.GAME_NAME, e.retcode, e.message, e.raw
+                "retcode={} message={!r} raw={} params={}",
+                self.GAME_NAME, e.retcode, e.message, e.raw, params
             )
             raise
 
-    async def buy_mimo_currency(self, *, lang: str = "en") -> list[dict]:
+    async def buy_mimo_currency(self, *, lang: typing.Optional[str] = None) -> list[dict]:
         """
         Compra monedas premium en la tienda mimo.
         Incluye delay entre compras para evitar patrones roboticos.
         """
         self._check_mimo_support()
+        lang = self._mimo_lang(lang)
         keywords = CURRENCY_ITEM_KEYWORDS.get(self.game_biz, [])
         if not keywords:
             logger.warning(
