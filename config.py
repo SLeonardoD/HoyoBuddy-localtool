@@ -324,15 +324,38 @@ MIMO_BASE_URL = "https://sg-public-api.hoyolab.com/event/e2023mimotravel"
 MIMO_GENSHIN_PATH_PREFIX = "qiuqiu"
 
 # Idioma (parametro "lang") de las requests del Mimo de Genshin (GAME_ID 2).
-# genshin.py envia "en-us" en TODAS sus requests del Mimo (Client(lang="en-us")
-# por defecto) y es lo unico, junto al prefijo, que las nuestras hacian distinto:
-# con "en", task_list y exchange_list de Genshin respondieron -510001
-# "Parameter Error" el 20/11/2026 (el index si respondia). HSR y ZZZ se
-# validaron en vivo con "en" y no se tocan: ver MIMO_LANG.
+# "en-us" es lo que usan genshin.py (Client(lang="en-us") por defecto, en todas
+# sus requests del Mimo) y hoyo-buddy en produccion. OJO: NO era la causa del
+# -510001 de Genshin (el 21/11/2026 siguio igual con "en-us"; ver
+# MIMO_GENSHIN_SETUP_RETCODE). Se mantiene por alinearse con quien funciona.
 MIMO_GENSHIN_LANG = "en-us"
 
-# Idioma de las requests del Mimo de los demas juegos (HSR, ZZZ).
+# Idioma de las requests del Mimo de los demas juegos (HSR, ZZZ), validado en
+# vivo con "en".
 MIMO_LANG = "en"
+
+# Genshin: el Mimo exige configurar el evento UNA vez en HoYoLAB con la cuenta.
+# Mientras no este hecho, task_list y exchange_list responden
+#   retcode -510001 "Parameter Error"
+# aunque la request sea correcta (el index si responde). Ocurrio el 20 y el
+# 21/11/2026 con una cuenta de Genshin sin configurar. hoyo-buddy (la app del
+# autor de genshin.py, con el Mimo de Genshin en produccion) trata ese mismo
+# retcode como "configura primero el evento Traveling Mimo en HoYoLAB"
+# (hoyo_buddy/hoyo/clients/gpy.py, GenshinClient._request_mimo; texto en
+# l10n/en_US.yaml, clave gi_mimo_start_desc). HSR y ZZZ no lo necesitan.
+MIMO_GENSHIN_SETUP_RETCODE = -510001
+
+# Pagina del evento que hoyo-buddy da para configurarlo (verificada por ellos
+# en abril de 2026; no se pudo abrir desde aqui y puede cambiar con cada
+# evento). Si da error: HoYoLAB -> Traveling Mimo / Mimo's Journey de Genshin.
+MIMO_GENSHIN_SETUP_URL = "https://act.hoyolab.com/ys/event/bbs-event-20251029points/index.html"
+
+# Estado de un articulo de la tienda del Mimo que si se puede comprar.
+# Fuente: genshin.py, MimoShopItemStatus (1 EXCHANGEABLE, 2 NOT_EXCHANGEABLE,
+# 3 LIMIT_REACHED, 4 SOLD_OUT). En los logs: "status=2 stock=0" = sin stock,
+# "status=3" = limite de compras alcanzado. Mandar un exchange de un articulo
+# que no esta en estado 1 es una request que se sabe que va a fallar.
+MIMO_SHOP_STATUS_EXCHANGEABLE = 1
 
 # Tipos de tarea mimo completables via finish_mimo_task() (no requieren
 # accion real dentro del juego). NO incluir GI_LOGIN(5), GI_GAME(6),

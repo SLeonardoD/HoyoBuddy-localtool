@@ -310,7 +310,7 @@ El programa crea/usa un archivo SQLite (por defecto `./hoyo_auth.db`, configurab
 pytest
 ```
 
-413 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
+425 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
 
 1. Un test verifica una regla de negocio, no un detalle de implementación.
 2. Los mensajes de assert explican qué se esperaba, qué se obtuvo, y por qué importa.
@@ -325,6 +325,7 @@ Estos principios están pensados para trasladarse a cualquier herramienta futura
 ## Limitaciones conocidas
 
 - **Honkai Impact 3rd**: check-in soportado; sin Mimo Viajero ni canje de códigos vía API (HoYoverse no los expone para este juego).
+- **Genshin Impact — Mimo Viajero**: cada cuenta debe configurar el evento **una vez** en HoYoLAB. Mientras no lo haga, las tareas y la tienda del Mimo de Genshin responden `-510001 Parameter Error` aunque la request sea correcta (el check-in no se ve afectado). La herramienta lo reconoce, muestra cómo resolverlo (el enlace está en `config.MIMO_GENSHIN_SETUP_URL`) y no insiste con la tienda. HSR y ZZZ no lo necesitan.
 - **Región CN**: sin Mimo Viajero ni canje de códigos (ver [Regiones OS y CN](#regiones-os-y-cn)). El check-in CN sí funciona, incluyendo la firma `ds` correspondiente.
 - **Tears of Themis**: no implementado todavía (ver [Roadmap](#roadmap)).
 - **Login por app sin validar en vivo todavía**: está portado de `genshin.py` y probado de punta a punta contra HoYoverse *simulado* (cifrado, firma, captcha v4/v3, verificación por email, persistencia), pero no contra el servidor real. Si falla, `OS_LOGIN_METHOD = "web"` vuelve al comportamiento anterior.

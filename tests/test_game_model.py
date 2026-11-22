@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+import typing
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 from aioresponses import aioresponses
+from loguru import logger
 
 import config
 from HoyoWrapper.session import HoyoAPIError, HoyoSession
@@ -607,11 +609,12 @@ class TestMimoUrls:
 
 class TestMimoLang:
     """
-    REGRESION (20/11/2026): con el prefijo ya corregido, task_list y
-    exchange_list de Genshin respondieron -510001 "Parameter Error". La unica
-    diferencia de parametros con genshin.py era lang ("en" vs "en-us", que
-    genshin.py envia en todas sus requests del Mimo). HSR y ZZZ estan
-    validados en vivo con "en" y no deben cambiar.
+    Idioma de las requests del Mimo: Genshin usa "en-us", como genshin.py (que
+    envia ese idioma en todas sus requests del Mimo) y hoyo-buddy. HSR y ZZZ
+    estan validados en vivo con "en" y no deben cambiar.
+
+    OJO: el idioma NO era la causa del -510001 de Genshin (el 21/11/2026 siguio
+    igual con "en-us"): esa causa es el evento sin configurar en HoYoLAB.
     """
 
     @staticmethod
@@ -630,14 +633,8 @@ class TestMimoLang:
         game.session.request = mock_request  # type: ignore[method-assign]
         return sent
 
-    def test_genshin_default_mimo_lang_comes_from_config_and_is_not_plain_en(
-        self, genshin: GenshinGame,
-    ) -> None:
+    def test_genshin_default_mimo_lang_comes_from_config(self, genshin: GenshinGame) -> None:
         assert genshin._mimo_lang() == config.MIMO_GENSHIN_LANG
-        assert config.MIMO_GENSHIN_LANG != "en", (
-            "config.MIMO_GENSHIN_LANG volvio a 'en': con ese valor task_list y "
-            "exchange_list de Genshin dieron -510001 en vivo. genshin.py usa 'en-us'."
-        )
 
     def test_other_games_keep_the_validated_lang(
         self, starrail: StarRailGame, zzz: ZZZGame,
@@ -681,6 +678,129 @@ class TestMimoLang:
 
         langs = {p.get("lang") for _, p in sent}
         assert langs == {config.MIMO_LANG}, f"HSR no debe cambiar de idioma. Enviado: {langs}"
+
+
+def _zzz_mimo_session(game, shop_items: list[dict], index_items: typing.Optional[list[dict]] = None):
+    """
+    Reemplaza session.request de un ZZZGame con un Mimo simulado.
+    Devuelve la lista de award_id para los que se mando un `exchange`.
+    """
+    exchanged: list[int] = []
+    index = index_items if index_items is not None else [{"game_id": 8, "version_id": 33}]
+
+    async def mock_request(method: str, url: str, **kwargs):
+        endpoint = url.rsplit("/", 1)[-1]
+        if endpoint == "index":
+            return {"list": index}
+        if endpoint == "exchange-list":
+            return {"exchange_award_list": shop_items}
+        if endpoint == "exchange":
+            exchanged.append(kwargs["body"]["award_id"])
+            return {"exchange_code": "CODIGO-DE-PRUEBA"}
+        raise AssertionError(f"Request inesperada del Mimo: {method} {url}")
+
+    game.session.request = mock_request  # type: ignore[method-assign]
+    return exchanged
+
+
+def _shop_item(award_id: int, name: str = "Polychrome x10", **fields) -> dict:
+    return {"award_id": award_id, "name": name, "cost": 100, **fields}
+
+
+class TestMimoShopPurchaseFilter:
+    """
+    ANTI-BANEO: no se manda un exchange que la propia lista de la tienda ya
+    marca como imposible. Log del 21/11/2026: ZZZ intento 4 compras de Polychrome
+    con status=2 stock=0 y las 4 respondieron -502006 "Out of stock".
+    """
+
+    @pytest.mark.asyncio
+    async def test_items_not_exchangeable_or_without_stock_are_not_sent(self, zzz: ZZZGame) -> None:
+        exchanged = _zzz_mimo_session(zzz, [
+            _shop_item(1, status=2, stock=0),     # sin stock (el caso del incidente)
+            _shop_item(2, status=3, stock=40),    # limite de compras alcanzado
+            _shop_item(3, status=4, stock=40),    # agotado
+            _shop_item(4, status=1, stock=0),     # "canjeable" pero sin stock
+            _shop_item(5, status=1, stock=12),    # el unico comprable
+        ])
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            result = await zzz.buy_mimo_currency()
+
+        assert exchanged == [5], (
+            f"Solo debe intentarse el articulo comprable (award_id 5). Se mando exchange para: {exchanged}"
+        )
+        assert [r["item_name"] for r in result] == ["Polychrome x10"]
+
+    @pytest.mark.asyncio
+    async def test_all_sold_out_sends_no_exchange_at_all(self, zzz: ZZZGame) -> None:
+        exchanged = _zzz_mimo_session(zzz, [
+            _shop_item(n, name=f"Polychrome x{n}", status=2, stock=0) for n in (4, 3, 2, 1)
+        ])
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            result = await zzz.buy_mimo_currency()
+
+        assert exchanged == [] and result == [], (
+            f"Con todo agotado no debe haber ni una request de compra. Enviadas: {exchanged}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_items_without_status_or_stock_are_still_attempted(self, zzz: ZZZGame) -> None:
+        """Preservacion: si la lista no trae el dato, no se descarta (comportamiento anterior)."""
+        exchanged = _zzz_mimo_session(zzz, [_shop_item(7)])
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await zzz.buy_mimo_currency()
+
+        assert exchanged == [7]
+
+    @pytest.mark.asyncio
+    async def test_only_currency_items_are_considered_as_before(self, zzz: ZZZGame) -> None:
+        exchanged = _zzz_mimo_session(zzz, [
+            _shop_item(8, name="Severian Avatar Frame (Permanent)", status=1, stock=500),
+            _shop_item(9, name="Polychrome x10", status=1, stock=500),
+        ])
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await zzz.buy_mimo_currency()
+
+        assert exchanged == [9]
+
+
+class TestMimoIndexEntryLog:
+    """El aviso 'Sin coincidencia exacta' solo debe salir cuando de verdad no la hubo."""
+
+    @staticmethod
+    async def _debug_messages(game, index_items: list[dict]) -> list[str]:
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+        try:
+            _zzz_mimo_session(game, [], index_items=index_items)
+            with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+                await game._get_mimo_version_id()
+        finally:
+            logger.remove(sink_id)
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_exact_match_that_is_also_the_first_item_does_not_warn(self, zzz: ZZZGame) -> None:
+        """Incidente de lectura: ZZZ (game_id 8) era el primer item de 2 y el log decia 'sin coincidencia'."""
+        messages = await self._debug_messages(zzz, [
+            {"game_id": 8, "version_id": 33}, {"game_id": 6, "version_id": 47},
+        ])
+
+        assert not any("Sin coincidencia" in m for m in messages), messages
+        assert zzz._mimo_version_id == 33
+
+    @pytest.mark.asyncio
+    async def test_no_match_warns_and_uses_the_first_item(self, zzz: ZZZGame) -> None:
+        messages = await self._debug_messages(zzz, [
+            {"game_id": 6, "version_id": 47}, {"game_id": 2, "version_id": 72},
+        ])
+
+        assert any("Sin coincidencia" in m for m in messages), messages
+        assert zzz._mimo_version_id == 47, "Sin coincidencia exacta se usa el primer item (sin cambios)."
 
 
 # ---------------------------------------------------------------------------

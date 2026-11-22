@@ -30,6 +30,7 @@ from app import (
     add_gift_code,
     redeem_pending_codes,
     _process_mimo_tasks,
+    _process_account_games,
     _process_mimo_buys,
     _redeem_with_token_refresh,
     _transport_error_text,
@@ -1494,8 +1495,8 @@ class TestHttpErrorsDoNotAbortTheDailyRun:
         game_2.buy_mimo_currency.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_unreachable_mimo_flag_is_set_only_for_http_or_network_errors(self) -> None:
-        """Un retcode de la API (HoyoAPIError) conserva el comportamiento anterior: no marca 'unreachable'."""
+    async def test_skip_shop_flag_is_set_only_for_http_or_network_errors(self) -> None:
+        """Un retcode cualquiera de la API (HoyoAPIError) conserva el comportamiento anterior: no marca 'skip_shop'."""
         api_game = _daily_game()
         api_game.get_mimo_tasks = AsyncMock(side_effect=HoyoAPIError(-100, "x", {}))
         http_game = _daily_game()
@@ -1506,8 +1507,8 @@ class TestHttpErrorsDoNotAbortTheDailyRun:
         await _process_mimo_tasks(api_game, state=api_state)
         await _process_mimo_tasks(http_game, state=http_state)
 
-        assert api_state == {}, "Un HoyoAPIError no debe marcar el Mimo como inalcanzable."
-        assert http_state == {"unreachable": True}, "Un 503 si debe marcarlo."
+        assert api_state == {}, "Un HoyoAPIError comun no debe omitir la tienda."
+        assert http_state == {"skip_shop": True}, "Un 503 si debe omitir la tienda."
 
     @pytest.mark.asyncio
     async def test_finish_http_error_stops_the_remaining_finishes(self) -> None:
@@ -1990,3 +1991,144 @@ class TestDailyTasksGameSelection:
         g_bob_2.claim_daily_reward.assert_awaited_once()
         g_alice_1.claim_daily_reward.assert_not_awaited()
         g_bob_1.claim_daily_reward.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Mimo de Genshin sin configurar (retcode -510001)
+#
+# Incidente (20 y 21/11/2026): con el prefijo y los parametros correctos (los
+# mismos que envia genshin.py), task_list y exchange_list de Genshin respondian
+# -510001 "Parameter Error". hoyo-buddy trata ese retcode como "configura
+# primero el evento Traveling Mimo en HoYoLAB": la cuenta debe configurarlo una
+# vez. El error no es de la request y repetirla no sirve.
+# ---------------------------------------------------------------------------
+
+def _genshin_daily_game(uid: str = "700000001") -> MagicMock:
+    game = _daily_game("Genshin Impact", "hk4e_global", uid=uid)
+    game.GAME_ID = 2
+    return game
+
+
+def _setup_error() -> HoyoAPIError:
+    return HoyoAPIError(config.MIMO_GENSHIN_SETUP_RETCODE, "Parameter Error", {})
+
+
+class TestGenshinMimoSetupRequired:
+
+    @pytest.mark.asyncio
+    async def test_task_list_error_explains_what_to_do(self) -> None:
+        game = _genshin_daily_game()
+        game.get_mimo_tasks = AsyncMock(side_effect=_setup_error())
+        state: dict = {}
+
+        result = await _process_mimo_tasks(game, state=state)
+
+        assert len(result) == 1 and result[0]["success"] is False
+        message = result[0]["message"]
+        assert config.MIMO_GENSHIN_SETUP_URL in message, (
+            f"El mensaje debe traer el enlace para configurar el evento. Obtenido: {message!r}"
+        )
+        assert "no esta configurado" in message
+        assert "Parameter Error" not in message, (
+            "El usuario no debe ver el 'Parameter Error' crudo, que no dice nada accionable."
+        )
+        assert state == {"skip_shop": True}
+
+    @pytest.mark.asyncio
+    async def test_shop_is_skipped_so_only_one_request_fails(self, ctx: AppContext) -> None:
+        """
+        ANTI-BANEO: antes (log del 21/11/2026) tras el fallo de task_list se
+        mandaba tambien exchange_list, que fallaba igual: 2 requests fallidas.
+        """
+        genshin = _genshin_daily_game()
+        genshin.get_mimo_tasks = AsyncMock(side_effect=_setup_error())
+        hsr = _daily_game("Honkai: Star Rail", "hkrpg_global", uid="800000001")
+
+        result, _, _ = await _run_daily_multi(ctx, {"Alice": [genshin, hsr]})
+
+        account = result["accounts"][0]
+        assert account["success"] is True, "Un Mimo sin configurar no debe romper la cuenta."
+        genshin.get_mimo_tasks.assert_awaited_once()
+        genshin.buy_mimo_currency.assert_not_awaited()
+        hsr.get_mimo_tasks.assert_awaited_once()
+        hsr.buy_mimo_currency.assert_awaited_once()
+        genshin_failures = [
+            t for t in account["tasks"]
+            if t["game_name"] == "Genshin Impact" and t["type"].startswith("mimo") and not t["success"]
+        ]
+        assert len(genshin_failures) == 1, (
+            f"Debe quedar UN solo aviso de Mimo para Genshin. Tareas: {account['tasks']}"
+        )
+        checkin = [t for t in account["tasks"] if t["game_name"] == "Genshin Impact" and t["type"] == "checkin"]
+        assert checkin and checkin[0]["success"] is True, "El check-in de Genshin no se ve afectado."
+
+    @pytest.mark.asyncio
+    async def test_same_retcode_in_other_games_is_a_plain_api_error(self) -> None:
+        """El significado es de Genshin: en HSR/ZZZ sigue siendo un error de API cualquiera."""
+        hsr = _daily_game("Honkai: Star Rail", "hkrpg_global", uid="800000001")
+        hsr.GAME_ID = 6
+        hsr.get_mimo_tasks = AsyncMock(side_effect=_setup_error())
+        state: dict = {}
+
+        result = await _process_mimo_tasks(hsr, state=state)
+
+        assert config.MIMO_GENSHIN_SETUP_URL not in result[0]["message"]
+        assert str(config.MIMO_GENSHIN_SETUP_RETCODE) in result[0]["message"]
+        assert state == {}, "No se cambia el comportamiento de HSR/ZZZ."
+
+    @pytest.mark.asyncio
+    async def test_other_genshin_api_errors_stay_plain(self) -> None:
+        game = _genshin_daily_game()
+        game.get_mimo_tasks = AsyncMock(side_effect=HoyoAPIError(-100, "Login required", {}))
+        state: dict = {}
+
+        result = await _process_mimo_tasks(game, state=state)
+
+        assert config.MIMO_GENSHIN_SETUP_URL not in result[0]["message"]
+        assert "-100" in result[0]["message"]
+        assert state == {}
+
+    @pytest.mark.asyncio
+    async def test_shop_step_also_explains_it_if_it_is_the_one_that_fails(self) -> None:
+        game = _genshin_daily_game()
+        game.buy_mimo_currency = AsyncMock(side_effect=_setup_error())
+
+        result = await _process_mimo_buys(game)
+
+        assert len(result) == 1 and result[0]["success"] is False and result[0]["type"] == "mimo_buy"
+        assert config.MIMO_GENSHIN_SETUP_URL in result[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_real_genshin_game_sends_only_index_and_task_list(self, genshin) -> None:
+        """
+        De punta a punta con la clase real GenshinGame (solo el limite de red
+        simulado): el dia de una cuenta sin configurar emite EXACTAMENTE dos
+        requests de Mimo, index y task_list. Antes eran tres (se sumaba
+        exchange_list, que fallaba igual).
+        """
+        sent: list[str] = []
+
+        async def mock_request(method: str, url: str, **kwargs):
+            endpoint = url.rsplit("/", 1)[-1]
+            sent.append(endpoint)
+            if endpoint == "index":
+                return {"act_list": [{"act_info": {"game_id": 2, "version_id": 72}}]}
+            if endpoint == "task_list":
+                raise _setup_error()
+            raise AssertionError(f"No debia pedirse '{endpoint}' con el Mimo sin configurar.")
+
+        genshin.session.request = mock_request  # type: ignore[method-assign]
+        genshin.claim_daily_reward = AsyncMock(return_value={
+            "message": "ok", "already_done": True, "total_sign_day": 3,
+        })
+        active = MagicMock(spec=ActiveSession)
+        active.games = [genshin]
+
+        with patch("app.random_delay", new=AsyncMock()):
+            with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+                tasks = await _process_account_games(active, "Alice")
+
+        assert sent == ["index", "task_list"], f"Requests de Mimo enviadas: {sent}"
+        mimo = [t for t in tasks if t["type"].startswith("mimo")]
+        assert len(mimo) == 1 and config.MIMO_GENSHIN_SETUP_URL in mimo[0]["message"]
+        assert any(t["type"] == "checkin" and t["success"] for t in tasks)

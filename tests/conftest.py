@@ -90,6 +90,46 @@ from HoyoWrapper.honkai_game import HonkaiGame
 
 
 # ---------------------------------------------------------------------------
+# Compatibilidad aioresponses <-> aiohttp >= 3.14
+# ---------------------------------------------------------------------------
+# aiohttp 3.14 exige el argumento keyword-only `stream_writer` en
+# ClientResponse.__init__, y aioresponses (0.7.9, la ultima publicada; su master
+# tampoco lo trata) no lo pasa: con aiohttp >= 3.14 fallaban 24 tests con
+#   TypeError: ClientResponse.__init__() missing 1 required keyword-only
+#   argument: 'stream_writer'
+# (aiohttp <= 3.13.5 funciona sin esto). Es un problema del mock de red de los
+# tests, no de la aplicacion. En vez de fijar una version vieja de aiohttp
+# (que en Python recientes puede no tener ruedas), se le da a la respuesta
+# simulada un `stream_writer` de mentira: aioresponses ya le pasa writer=None
+# ("la request ya se envio") y en ese caso aiohttp solo lee
+# `stream_writer.output_size`, asi que basta un objeto con output_size = 0.
+#
+# Solo actua cuando hace falta: no hace nada con un aiohttp que no exige el
+# argumento, ni con un aioresponses que ya lo pase. Si aioresponses publica
+# una version compatible, este bloque entero se puede borrar.
+
+def _patch_aioresponses_for_new_aiohttp() -> None:
+    import inspect
+    import types
+
+    import aioresponses.core as ar_core
+
+    stream_writer = inspect.signature(ar_core.ClientResponse.__init__).parameters.get("stream_writer")
+    if stream_writer is None or stream_writer.default is not inspect.Parameter.empty:
+        return
+
+    class _ClientResponseCompat(ar_core.ClientResponse):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("stream_writer", types.SimpleNamespace(output_size=0))
+            super().__init__(*args, **kwargs)
+
+    ar_core.ClientResponse = _ClientResponseCompat
+
+
+_patch_aioresponses_for_new_aiohttp()
+
+
+# ---------------------------------------------------------------------------
 # Constantes de prueba
 # ---------------------------------------------------------------------------
 

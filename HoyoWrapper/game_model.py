@@ -418,17 +418,20 @@ class BaseGame:
         entry = next(
             (i for i in items
              if i.get("game_id") == self.GAME_ID or i.get("game") == self.GAME_ID),
-            items[0],
+            None,
         )
-        logger.debug(
-            "[MIMO] entrada del index elegida | game={} entry={}",
-            self.GAME_NAME, entry
-        )
-        if entry is items[0] and len(items) > 1:
+        if entry is None:
+            # Antes se avisaba tambien cuando la coincidencia ERA el primer item
+            # (ej. ZZZ con 2 items en el index), lo que confundia al leer el log.
+            entry = items[0]
             logger.debug(
                 "[MIMO] Sin coincidencia exacta game_id={}, usando primer item: {}",
                 self.GAME_ID, entry
             )
+        logger.debug(
+            "[MIMO] entrada del index elegida | game={} entry={}",
+            self.GAME_NAME, entry
+        )
 
         version_id = entry.get("version_id") or entry.get("id")
         if not version_id:
@@ -638,6 +641,27 @@ class BaseGame:
                 continue
             award_id = item.get("award_id")
             if not award_id:
+                continue
+
+            # ANTI-BANEO: no se manda un exchange que ya se sabe que va a
+            # fallar. La propia lista indica que no se puede comprar: status
+            # distinto de "canjeable" (2 sin stock, 3 limite alcanzado, 4
+            # agotado) o stock 0. Antes se intentaba igual: el log del
+            # 21/11/2026 muestra 4 exchange de ZZZ (Polychrome, status=2
+            # stock=0) que respondieron -502006 "Out of stock" una a una.
+            # Si la lista no trae el dato, no se descarta (se conserva el
+            # comportamiento anterior).
+            status = item.get("status")
+            stock = item.get("stock")
+            if (
+                (status is not None and status != config.MIMO_SHOP_STATUS_EXCHANGEABLE)
+                or (stock is not None and stock <= 0)
+            ):
+                logger.debug(
+                    "[MIMO] Se omite articulo no comprable | game={} item={!r} "
+                    "status={} stock={}",
+                    self.GAME_NAME, item.get("name"), status, stock
+                )
                 continue
 
             # ANTI-BANEO: antes este delay se saltaba para la primera

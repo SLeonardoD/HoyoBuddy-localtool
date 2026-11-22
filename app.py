@@ -90,6 +90,28 @@ def _error_text(e: BaseException) -> str:
     return str(e) if isinstance(e, HoyoAPIError) else _transport_error_text(e)
 
 
+def _genshin_mimo_setup_required(game, e: BaseException) -> bool:
+    """
+    True si `e` es el error con el que el Mimo de Genshin avisa que la cuenta
+    aun no configuro el evento en HoYoLAB (ver config.MIMO_GENSHIN_SETUP_RETCODE).
+    Solo Genshin: en HSR/ZZZ ese retcode seguiria siendo un error cualquiera.
+    """
+    return (
+        isinstance(e, HoyoAPIError)
+        and e.retcode == config.MIMO_GENSHIN_SETUP_RETCODE
+        and game.GAME_ID == 2
+    )
+
+
+def _genshin_mimo_setup_message() -> str:
+    """Mensaje para el resumen: que paso y que hacer."""
+    return (
+        "El Mimo de Genshin no esta configurado en esta cuenta. Abre "
+        f"{config.MIMO_GENSHIN_SETUP_URL} con esta cuenta, completa la "
+        "configuracion del evento y vuelve a ejecutar."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Contexto de la aplicacion
 # ---------------------------------------------------------------------------
@@ -600,13 +622,14 @@ async def _process_account_games(
         tasks.extend(mimo_tasks)
 
         # ── Mimo: compra de moneda ───────────────────────────────────
-        # ANTI-BANEO: si el Mimo ni siquiera respondio al listar las tareas
-        # (404, 5xx, timeout), la tienda empezaria por la MISMA request
-        # (el index, que no quedo en cache) y volveria a fallar: no se
-        # insiste. Se vuelve a intentar en la proxima corrida.
-        if mimo_state.get("unreachable"):
+        # ANTI-BANEO: si el Mimo no se pudo usar al listar las tareas (no
+        # respondio: 404, 5xx, timeout; o en Genshin, evento sin configurar),
+        # la tienda fallaria igual: o empezaria por la MISMA request (el index,
+        # que no quedo en cache) o respondera el mismo error. No se insiste;
+        # se vuelve a intentar en la proxima corrida.
+        if mimo_state.get("skip_shop"):
             logger.warning(
-                "    [Mimo compra] Omitida: el Mimo de {} no respondio al "
+                "    [Mimo compra] Omitida: el Mimo de {} no se pudo usar al "
                 "listar las tareas; no se insiste con otra request.",
                 game.GAME_NAME,
             )
@@ -645,8 +668,9 @@ async def _process_mimo_tasks(
     en un paso con varias requests iguales (completar o reclamar), se corta el
     paso en la primera: si el endpoint no responde, las demas tampoco, y no
     se las manda una por una al servidor. Si falla el LISTADO de tareas por
-    esta causa, se marca state["unreachable"] = True para que quien llama
-    omita la tienda (ver _process_account_games).
+    esta causa, o porque el Mimo de Genshin no esta configurado en la cuenta
+    (ver _genshin_mimo_setup_required), se marca state["skip_shop"] = True para
+    que quien llama omita la tienda (ver _process_account_games).
     """
     from HoyoWrapper.game_model import MIMO_FINISHABLE_TASK_TYPES
 
@@ -657,12 +681,27 @@ async def _process_mimo_tasks(
     except NotImplementedError:
         return []
     except _STEP_ERRORS as e:
+        if _genshin_mimo_setup_required(game, e):
+            logger.warning(
+                "[APP] Mimo de Genshin sin configurar en esta cuenta | game={} "
+                "retcode={} | configurar en {}",
+                game.GAME_NAME, e.retcode, config.MIMO_GENSHIN_SETUP_URL,
+            )
+            if state is not None:
+                state["skip_shop"] = True
+            return [{
+                "type":      "mimo_task",
+                "game_name": game.GAME_NAME,
+                "success":   False,
+                "message":   _genshin_mimo_setup_message(),
+                "detail":    "",
+            }]
         logger.warning(
             "[APP] Error al obtener tareas mimo | game={} error={}",
             game.GAME_NAME, _error_text(e),
         )
         if state is not None and isinstance(e, _TRANSPORT_ERRORS):
-            state["unreachable"] = True
+            state["skip_shop"] = True
         return [{
             "type":      "mimo_task",
             "game_name": game.GAME_NAME,
@@ -794,6 +833,19 @@ async def _process_mimo_buys(game) -> list[TaskResult]:
     except NotImplementedError:
         return []  # Honkai o CN: sin mimo
     except _STEP_ERRORS as e:
+        if _genshin_mimo_setup_required(game, e):
+            logger.warning(
+                "    [Mimo compra] Mimo de Genshin sin configurar en esta cuenta "
+                "(retcode={}); configurar en {}",
+                e.retcode, config.MIMO_GENSHIN_SETUP_URL,
+            )
+            return [{
+                "type":      "mimo_buy",
+                "game_name": game.GAME_NAME,
+                "success":   False,
+                "message":   _genshin_mimo_setup_message(),
+                "detail":    "",
+            }]
         logger.warning("    [Mimo compra] Error: {}", _error_text(e))
         return [{
             "type":      "mimo_buy",
