@@ -376,10 +376,20 @@ MIMO_TASK_STATUS_CLAIMED = 3    # ya reclamada
 
 # Keywords (en minusculas) para identificar el item de moneda premium
 # en la tienda mimo, por juego. HoYoverse puede renombrar el item.
+#
+# Se comparan contra el NOMBRE del item en ingles (buy_mimo_currency pide la
+# lista en ingles), como subcadena: "primogem" encuentra "Primogems".
+# Lo que la tienda OS vende de verdad (log del 21/11/2026, y MIMO_VALUABLE_KEYWORDS
+# de hoyo-buddy = "Stellar Jades", "Polychrome", "Primogems"):
+#   HSR: "60 Stellar Jades"   ZZZ: "Polychrome x10/x30/x60/x100"   Genshin: Primogems
+# Antes HSR buscaba solo "oneiric shard" y Genshin solo "genesis crystal": como
+# ninguno aparece en la tienda, la compra de Stellar Jades y de Primogems no se
+# intentaba nunca, sin dar ningun error. Se conservan las keywords viejas por si
+# la tienda vuelve a ofrecerlas.
 CURRENCY_ITEM_KEYWORDS: dict[str, list[str]] = {
-    "hk4e_global":  ["genesis crystal", "genesis crystals"],
+    "hk4e_global":  ["primogem", "genesis crystal", "genesis crystals"],
     "hk4e_cn":      ["创世结晶"],
-    "hkrpg_global": ["oneiric shard", "oneiric shards"],
+    "hkrpg_global": ["stellar jade", "oneiric shard", "oneiric shards"],
     "hkrpg_cn":     ["星琼"],
     "nap_global":   ["monochrome", "polychrome"],
     "nap_cn":       ["菲林", "加密母带"],
@@ -553,6 +563,11 @@ DELAY_CHECKIN_TO_MIMO: tuple[float, float] = (3.0, 7.0)
 # Navegar de la pestaña de tareas del mimo a la pestaña de tienda/canje
 # — antes tambien con delay CERO.
 DELAY_MIMO_TASKS_TO_SHOP: tuple[float, float] = (2.5, 6.0)
+
+# ANTI-BANEO: pausa entre ver la lista de la tienda del Mimo y consultar los
+# puntos actuales (index) antes de decidir que comprar. Solo se paga cuando hay
+# algun articulo de moneda comprable (ver buy_mimo_currency).
+DELAY_MIMO_SHOP_TO_POINTS: tuple[float, float] = (2.0, 5.0)
 
 # Justo despues de restaurar/validar una sesion (pagina recien
 # "cargada") y ANTES de la primera accion real sobre esa cuenta — a

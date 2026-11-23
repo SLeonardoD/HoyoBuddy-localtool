@@ -56,7 +56,7 @@ Desde el menú de consola (`main.py`):
 1. **Agregar cuenta** — login con email + contraseña, resuelve el captcha Geetest automáticamente, guarda la sesión.
 2. **Listar cuentas** — muestra alias, región y fecha de registro de cada cuenta guardada.
 3. **Eliminar cuenta** — quita una cuenta de la lista visible (ver nota sobre soft-delete en [Base de datos](#base-de-datos)).
-4. **Completar tareas diarias** — para cada cuenta y cada juego: check-in diario, reclamar tareas del Mimo Viajero, y comprar moneda premium con los puntos acumulados.
+4. **Completar tareas diarias** — para cada cuenta y cada juego: check-in diario, reclamar tareas del Mimo Viajero, y comprar moneda premium (Primogemas, Stellar Jades, Polychrome) con los puntos acumulados. La compra solo se intenta si hay stock y los puntos alcanzan: antes de comprar se consultan los puntos actuales y no se manda ninguna request que ya se sabe que va a fallar.
    - **Enter** ejecuta todo (todas las cuentas, todos sus juegos). **`e`** permite elegir: primero las cuentas (`1,3`, `1-3`) y luego, cuando le toca el turno a cada una, los juegos que detectó en ella (Enter = todos, números = solo esos, `0` o Ctrl+C = omitir la cuenta). Sirve para probar un solo juego o una sola cuenta sin tocar las demás.
 5. **Canjear código de regalo (manual)** — el usuario elige el juego, pega un código, y se canjea en todas las cuentas OS que tengan ese juego.
 6. **Agregar código de regalo a la base de datos** — guarda un código para que el sistema automático lo recuerde y lo canjee en cualquier cuenta futura sin volver a pedirlo.
@@ -310,7 +310,7 @@ El programa crea/usa un archivo SQLite (por defecto `./hoyo_auth.db`, configurab
 pytest
 ```
 
-425 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
+441 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
 
 1. Un test verifica una regla de negocio, no un detalle de implementación.
 2. Los mensajes de assert explican qué se esperaba, qué se obtuvo, y por qué importa.

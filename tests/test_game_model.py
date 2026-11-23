@@ -768,6 +768,265 @@ class TestMimoShopPurchaseFilter:
         assert exchanged == [9]
 
 
+def _mimo_shop_session(
+    game,
+    shop_items: list[dict],
+    *,
+    points: typing.Union[None, int, list[typing.Optional[int]]] = None,
+    index_error_on_call: typing.Optional[int] = None,
+    exchange_errors: typing.Optional[dict[int, int]] = None,
+):
+    """
+    Mimo simulado para cualquier juego (formato de index segun GAME_ID).
+
+    points: puntos que devuelve el index. Un int vale para todas las llamadas;
+        una lista da un valor distinto por llamada (la 1.a es la del
+        version_id, la 2.a la de los puntos antes de comprar); None = el index
+        no trae el campo.
+    index_error_on_call: n.o de llamada al index (desde 1) que falla.
+    exchange_errors: {award_id: retcode} para hacer fallar ciertas compras.
+
+    Devuelve (endpoints pedidos en orden, award_id con exchange enviado).
+    """
+    requests: list[str] = []
+    exchanged: list[int] = []
+    index_calls = 0
+
+    async def mock_request(method: str, url: str, **kwargs):
+        nonlocal index_calls
+        endpoint = url.rsplit("/", 1)[-1].replace("_", "-")
+        requests.append(endpoint)
+        if endpoint == "index":
+            index_calls += 1
+            if index_error_on_call == index_calls:
+                raise HoyoAPIError(-1, "index no disponible", {})
+            entry: dict = {"game_id": game.GAME_ID, "version_id": 33}
+            value = points[min(index_calls, len(points)) - 1] if isinstance(points, list) else points
+            if value is not None:
+                entry["point"] = value
+            if game.GAME_ID == 2:
+                return {"act_list": [{"act_info": entry}]}
+            return {"list": [entry]}
+        if endpoint == "exchange-list":
+            return {"exchange_award_list": shop_items}
+        if endpoint == "exchange":
+            award_id = kwargs["body"]["award_id"]
+            exchanged.append(award_id)
+            if exchange_errors and award_id in exchange_errors:
+                raise HoyoAPIError(exchange_errors[award_id], "Out of stock", {})
+            return {"exchange_code": f"CODIGO-{award_id}"}
+        raise AssertionError(f"Request inesperada del Mimo: {method} {url}")
+
+    game.session.request = mock_request  # type: ignore[method-assign]
+    return requests, exchanged
+
+
+def _currency_item(award_id: int, name: str, cost: int, **fields) -> dict:
+    return {"award_id": award_id, "name": name, "cost": cost, "status": 1, "stock": 10, **fields}
+
+
+class TestMimoCurrencyKeywords:
+    """
+    La tienda OS vende "Primogems" (Genshin), "Stellar Jades" (HSR) y "Polychrome"
+    (ZZZ). Antes Genshin buscaba solo "genesis crystal" y HSR solo "oneiric
+    shard": no existian en la tienda y la compra no se intentaba nunca, en
+    silencio (en el log del 21/11/2026, HSR listo "60 Stellar Jades" y la
+    herramienta dijo "sin monedas disponibles").
+    """
+
+    @pytest.mark.asyncio
+    async def test_genshin_buys_primogems(self, genshin: GenshinGame) -> None:
+        _, exchanged = _mimo_shop_session(genshin, [
+            _currency_item(1, "Hilichurl Avatar Frame (Permanent)", 150),
+            _currency_item(2, "60 Primogems", 300),
+        ], points=500)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            result = await genshin.buy_mimo_currency()
+
+        assert exchanged == [2], f"Debia comprar solo las Primogems (award_id 2). Enviados: {exchanged}"
+        assert [r["item_name"] for r in result] == ["60 Primogems"]
+
+    @pytest.mark.asyncio
+    async def test_starrail_buys_stellar_jades(self, starrail: StarRailGame) -> None:
+        _, exchanged = _mimo_shop_session(starrail, [
+            _currency_item(3, "5 Traveler's Guides", 250),
+            _currency_item(5, "60 Stellar Jades", 300),
+        ], points=400)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            result = await starrail.buy_mimo_currency()
+
+        assert exchanged == [5], f"Debia comprar solo las Stellar Jades (award_id 5). Enviados: {exchanged}"
+        assert [r["item_name"] for r in result] == ["60 Stellar Jades"]
+
+    def test_keywords_cover_the_real_currency_names_of_every_global_game(self) -> None:
+        for biz, real_name in [
+            ("hk4e_global", "60 Primogems"),
+            ("hkrpg_global", "60 Stellar Jades"),
+            ("nap_global", "Polychrome x10"),
+        ]:
+            keywords = config.CURRENCY_ITEM_KEYWORDS[biz]
+            assert any(kw.lower() in real_name.lower() for kw in keywords), (
+                f"{biz}: ninguna keyword {keywords} encuentra el item real {real_name!r}."
+            )
+
+
+class TestMimoCurrencyPointsGuard:
+    """
+    ANTI-BANEO: no se manda una compra que no alcanza con los puntos actuales
+    (seria otra request fallida), y los puntos se consultan solo si hay algo
+    comprable. Caso real: HSR con 70 y 120 puntos frente a Stellar Jades de 300.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unaffordable_item_sends_no_exchange(self, zzz: ZZZGame) -> None:
+        requests, exchanged = _mimo_shop_session(zzz, [
+            _currency_item(1, "Polychrome x60", 300),
+        ], points=70)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            result = await zzz.buy_mimo_currency()
+
+        assert exchanged == [] and result == [], f"Con 70 puntos no se puede comprar algo de 300: {exchanged}"
+        assert requests == ["index", "exchange-list", "index"], (
+            f"Esperado: version, lista de la tienda y puntos (sin exchange). Obtenido: {requests}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_buys_what_fits_and_tracks_the_remaining_points(self, zzz: ZZZGame) -> None:
+        _, exchanged = _mimo_shop_session(zzz, [
+            _currency_item(4, "Polychrome x10", 100),
+            _currency_item(3, "Polychrome x30", 200),
+            _currency_item(2, "Polychrome x60", 300),
+            _currency_item(1, "Polychrome x100", 500),
+        ], points=350)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await zzz.buy_mimo_currency()
+
+        # 350 -> compra x10 (100) -> 250 -> compra x30 (200) -> 50 -> x60 y x100 ya no alcanzan.
+        assert exchanged == [4, 3], f"Compras enviadas: {exchanged}"
+
+    @pytest.mark.asyncio
+    async def test_points_are_fetched_fresh_not_taken_from_the_version_request(self, zzz: ZZZGame) -> None:
+        """Los puntos suben al reclamar tareas: se usan los del momento de comprar, no los del inicio."""
+        _, exchanged = _mimo_shop_session(zzz, [
+            _currency_item(1, "Polychrome x100", 500),
+        ], points=[10, 800])   # 1.a llamada (version_id): 10; 2.a (antes de comprar): 800
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await zzz.buy_mimo_currency()
+
+        assert exchanged == [1], "Con los puntos frescos (800) alcanza; con los del inicio (10) no."
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_buy_costs_no_extra_request_and_no_delay(self, zzz: ZZZGame) -> None:
+        """El caso del log: todo agotado. Ni consulta de puntos ni pausa extra."""
+        requests, exchanged = _mimo_shop_session(zzz, [
+            _currency_item(n, f"Polychrome x{n}", 100 * n, status=2, stock=0) for n in (4, 3, 2, 1)
+        ], points=715)
+        delay = AsyncMock()
+
+        with patch("HoyoWrapper.game_model.random_delay", new=delay):
+            result = await zzz.buy_mimo_currency()
+
+        assert result == [] and exchanged == []
+        assert requests == ["index", "exchange-list"], f"No debia pedirse el index de nuevo. Obtenido: {requests}"
+        assert not any(c.args == config.DELAY_MIMO_SHOP_TO_POINTS for c in delay.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_points_request_is_preceded_by_its_own_delay(self, zzz: ZZZGame) -> None:
+        _mimo_shop_session(zzz, [_currency_item(1, "Polychrome x10", 100)], points=500)
+        delay = AsyncMock()
+
+        with patch("HoyoWrapper.game_model.random_delay", new=delay):
+            await zzz.buy_mimo_currency()
+
+        waits = [c.args for c in delay.call_args_list]
+        assert waits.count(config.DELAY_MIMO_SHOP_TO_POINTS) == 1, f"Pausas pedidas: {waits}"
+        assert waits.index(config.DELAY_MIMO_SHOP_TO_POINTS) < waits.index(config.DELAY_BETWEEN_MIMO_PURCHASES), (
+            "La pausa de los puntos va ANTES de la primera compra."
+        )
+
+    @pytest.mark.asyncio
+    async def test_index_without_points_keeps_the_previous_behaviour(self, zzz: ZZZGame) -> None:
+        """Si el index no trae `point` no se puede decidir: se intenta como antes."""
+        _, exchanged = _mimo_shop_session(zzz, [_currency_item(1, "Polychrome x100", 500)], points=None)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await zzz.buy_mimo_currency()
+
+        assert exchanged == [1]
+
+    @pytest.mark.asyncio
+    async def test_failed_points_request_buys_nothing_and_propagates(self, zzz: ZZZGame) -> None:
+        _, exchanged = _mimo_shop_session(zzz, [_currency_item(1, "Polychrome x10", 100)],
+                                          points=500, index_error_on_call=2)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            with pytest.raises(HoyoAPIError):
+                await zzz.buy_mimo_currency()
+
+        assert exchanged == [], "Sin poder comprobar los puntos no se compra a ciegas."
+
+    @pytest.mark.asyncio
+    async def test_a_failed_purchase_does_not_spend_points(self, zzz: ZZZGame) -> None:
+        _, exchanged = _mimo_shop_session(zzz, [
+            _currency_item(1, "Polychrome x10", 100),
+            _currency_item(2, "Polychrome x30", 100),
+        ], points=150, exchange_errors={1: -502006})
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            result = await zzz.buy_mimo_currency()
+
+        assert exchanged == [1, 2], "El fallo de la 1.a no debe descontar puntos: la 2.a (100) aun alcanza con 150."
+        assert [r["item_name"] for r in result] == ["Polychrome x30"]
+
+    @pytest.mark.asyncio
+    async def test_numeric_strings_in_cost_and_points_are_understood(self, zzz: ZZZGame) -> None:
+        _, exchanged = _mimo_shop_session(zzz, [
+            _currency_item(1, "Polychrome x60", "300"),
+            _currency_item(2, "Polychrome x10", "100"),
+        ], points="150")
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            await zzz.buy_mimo_currency()
+
+        assert exchanged == [2]
+
+
+class TestGetMimoPoints:
+
+    @pytest.mark.asyncio
+    async def test_returns_the_points_of_the_index_entry(self, genshin: GenshinGame) -> None:
+        _mimo_shop_session(genshin, [], points=123)
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            assert await genshin.get_mimo_points() == 123
+
+    @pytest.mark.asyncio
+    async def test_is_not_cached_every_call_is_a_real_request(self, zzz: ZZZGame) -> None:
+        requests, _ = _mimo_shop_session(zzz, [], points=[10, 20])
+
+        with patch("HoyoWrapper.game_model.random_delay", new=AsyncMock()):
+            first = await zzz.get_mimo_points()
+            second = await zzz.get_mimo_points()
+
+        assert (first, second) == (10, 20) and requests == ["index", "index"]
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_the_index_has_no_points(self, zzz: ZZZGame) -> None:
+        _mimo_shop_session(zzz, [], points=None)
+
+        assert await zzz.get_mimo_points() is None
+
+    @pytest.mark.asyncio
+    async def test_games_without_mimo_are_rejected_before_any_request(self, honkai: HonkaiGame) -> None:
+        with pytest.raises(NotImplementedError):
+            await honkai.get_mimo_points()
+
+
 class TestMimoIndexEntryLog:
     """El aviso 'Sin coincidencia exacta' solo debe salir cuando de verdad no la hubo."""
 

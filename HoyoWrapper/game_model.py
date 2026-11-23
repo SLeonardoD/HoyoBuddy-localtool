@@ -107,6 +107,14 @@ _RETRY_KWARGS = dict(
 # Clase base
 # ---------------------------------------------------------------------------
 
+def _as_int(value: typing.Any) -> typing.Optional[int]:
+    """int(value), o None si falta o no es un numero (campos de la API del Mimo)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class BaseGame:
     """
     Clase base para los modulos de juego.
@@ -369,15 +377,16 @@ class BaseGame:
             return lang
         return config.MIMO_GENSHIN_LANG if self.GAME_ID == 2 else config.MIMO_LANG
 
-    async def _get_mimo_version_id(self) -> int:
-        """Obtiene el version_id activo del mimo. Cacheado por instancia."""
-        if self._mimo_version_id is not None:
-            return self._mimo_version_id
-
+    async def _fetch_mimo_index(self, purpose: str) -> tuple[dict, typing.Any]:
+        """
+        Pide el index del Mimo (SIEMPRE una request real, sin cache) y devuelve
+        (entrada de ESTE juego, respuesta completa). La entrada trae version_id
+        y los puntos actuales (`point`). `purpose` solo etiqueta el log.
+        """
         url = self._mimo_url("index")
         logger.debug(
-            "[MIMO] _get_mimo_version_id | game={} game_id={} url={}",
-            self.GAME_NAME, self.GAME_ID, url
+            "[MIMO] {} | game={} game_id={} url={}",
+            purpose, self.GAME_NAME, self.GAME_ID, url
         )
 
         try:
@@ -432,6 +441,14 @@ class BaseGame:
             "[MIMO] entrada del index elegida | game={} entry={}",
             self.GAME_NAME, entry
         )
+        return entry, data
+
+    async def _get_mimo_version_id(self) -> int:
+        """Obtiene el version_id activo del mimo. Cacheado por instancia."""
+        if self._mimo_version_id is not None:
+            return self._mimo_version_id
+
+        entry, data = await self._fetch_mimo_index("_get_mimo_version_id")
 
         version_id = entry.get("version_id") or entry.get("id")
         if not version_id:
@@ -454,6 +471,23 @@ class BaseGame:
         # vuelven a pasar por aca.
         await random_delay(*config.DELAY_MIMO_VERSION_TO_ACTION)
         return self._mimo_version_id
+
+    async def get_mimo_points(self) -> typing.Optional[int]:
+        """
+        Puntos actuales del Mimo para este juego (campo `point` del index).
+
+        A diferencia del version_id NO se cachea: los puntos cambian al
+        reclamar tareas, y para decidir una compra hacen falta los de ahora.
+        Cuesta una request (la misma que hace genshin.py en
+        get_mimo_point_count). Devuelve None si el index no trae el dato.
+        """
+        self._check_mimo_support()
+        entry, _ = await self._fetch_mimo_index("get_mimo_points")
+        points = _as_int(entry.get("point"))
+        logger.info(
+            "[MIMO] puntos actuales | game={} point={}", self.GAME_NAME, points
+        )
+        return points
 
     async def get_mimo_tasks(self, *, lang: typing.Optional[str] = None) -> list[dict]:
         """Lista de tareas del mimo viajero."""
@@ -619,6 +653,14 @@ class BaseGame:
     async def buy_mimo_currency(self, *, lang: typing.Optional[str] = None) -> list[dict]:
         """
         Compra monedas premium en la tienda mimo.
+
+        ANTI-BANEO: solo se manda un `exchange` cuando se espera que funcione.
+        Se descartan, sin ninguna request, los articulos que la lista ya marca
+        como imposibles (status distinto de "canjeable", o stock 0) y, con los
+        puntos actuales a la vista, los que cuestan mas de lo que hay. Antes se
+        intentaban todos: el log del 21/11/2026 muestra 4 compras de ZZZ
+        respondiendo "Out of stock" y, en HSR/Genshin, la compra ni siquiera
+        buscaba el nombre correcto de la moneda (ver CURRENCY_ITEM_KEYWORDS).
         Incluye delay entre compras para evitar patrones roboticos.
         """
         self._check_mimo_support()
@@ -633,26 +675,19 @@ class BaseGame:
 
         items = await self.get_mimo_shop_items(lang=lang)
         version_id = await self._get_mimo_version_id()
-        results: list[dict] = []
 
+        # 1) Candidatos: sin I/O. Moneda premium + comprable segun la lista.
+        candidates: list[dict] = []
         for item in items:
             name_lower = item.get("name", "").lower()
             if not any(kw.lower() in name_lower for kw in keywords):
                 continue
-            award_id = item.get("award_id")
-            if not award_id:
+            if not item.get("award_id"):
                 continue
 
-            # ANTI-BANEO: no se manda un exchange que ya se sabe que va a
-            # fallar. La propia lista indica que no se puede comprar: status
-            # distinto de "canjeable" (2 sin stock, 3 limite alcanzado, 4
-            # agotado) o stock 0. Antes se intentaba igual: el log del
-            # 21/11/2026 muestra 4 exchange de ZZZ (Polychrome, status=2
-            # stock=0) que respondieron -502006 "Out of stock" una a una.
-            # Si la lista no trae el dato, no se descarta (se conserva el
-            # comportamiento anterior).
-            status = item.get("status")
-            stock = item.get("stock")
+            # Si la lista no trae el dato, no se descarta (comportamiento anterior).
+            status = _as_int(item.get("status"))
+            stock = _as_int(item.get("stock"))
             if (
                 (status is not None and status != config.MIMO_SHOP_STATUS_EXCHANGEABLE)
                 or (stock is not None and stock <= 0)
@@ -661,6 +696,39 @@ class BaseGame:
                     "[MIMO] Se omite articulo no comprable | game={} item={!r} "
                     "status={} stock={}",
                     self.GAME_NAME, item.get("name"), status, stock
+                )
+                continue
+            candidates.append(item)
+
+        if not candidates:
+            logger.info(
+                "[MIMO] Sin monedas comprables ahora | game={} (agotadas o no listadas)",
+                self.GAME_NAME
+            )
+            return []
+
+        # 2) Puntos actuales (request fresca: cambian al reclamar tareas).
+        # Solo se paga si hay algo que comprar. Si falla, la excepcion sube y
+        # app la reporta como error de la compra; no se compra a ciegas.
+        await random_delay(*config.DELAY_MIMO_SHOP_TO_POINTS)
+        points = await self.get_mimo_points()
+        if points is None:
+            logger.warning(
+                "[MIMO] El index no trae los puntos | game={}: se intentan las "
+                "compras sin comprobar si alcanzan",
+                self.GAME_NAME
+            )
+
+        results: list[dict] = []
+        for item in candidates:
+            award_id = item["award_id"]
+            cost = _as_int(item.get("cost"))
+
+            if points is not None and cost is not None and cost > points:
+                logger.info(
+                    "[MIMO] Puntos insuficientes, no se compra | game={} item={!r} "
+                    "cost={} points={}",
+                    self.GAME_NAME, item.get("name"), cost, points
                 )
                 continue
 
@@ -693,6 +761,8 @@ class BaseGame:
                     self.GAME_NAME, item.get("name"), code, data
                 )
                 results.append({"item_name": item.get("name"), "code": code})
+                if points is not None and cost is not None:
+                    points -= cost
             except HoyoAPIError as e:
                 logger.error(
                     "[MIMO] Error en exchange | game={} item={!r} "
