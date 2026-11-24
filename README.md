@@ -17,13 +17,14 @@ Automatización de tareas diarias en HoYoLab (check-in, Mimo Viajero, canje de c
 9. [Sesiones y renovación del token](#sesiones-y-renovación-del-token)
 10. [Seguridad anti-baneo](#seguridad-anti-baneo)
 11. [Regiones OS y CN](#regiones-os-y-cn)
-12. [`config.py` — valores que cambian con el tiempo](#configpy--valores-que-cambian-con-el-tiempo)
-13. [Instalación y uso](#instalación-y-uso)
-14. [Tests](#tests)
-15. [Limitaciones conocidas](#limitaciones-conocidas)
-16. [Mantenimiento futuro](#mantenimiento-futuro)
-17. [Roadmap](#roadmap)
-18. [Créditos y fuente de verdad](#créditos-y-fuente-de-verdad)
+12. [Mimo Viajero: configuración inicial y dos versiones](#mimo-viajero-configuración-inicial-y-dos-versiones)
+13. [`config.py` — valores que cambian con el tiempo](#configpy--valores-que-cambian-con-el-tiempo)
+14. [Instalación y uso](#instalación-y-uso)
+15. [Tests](#tests)
+16. [Limitaciones conocidas](#limitaciones-conocidas)
+17. [Mantenimiento futuro](#mantenimiento-futuro)
+18. [Roadmap](#roadmap)
+19. [Créditos y fuente de verdad](#créditos-y-fuente-de-verdad)
 
 ---
 
@@ -56,7 +57,7 @@ Desde el menú de consola (`main.py`):
 1. **Agregar cuenta** — login con email + contraseña, resuelve el captcha Geetest automáticamente, guarda la sesión.
 2. **Listar cuentas** — muestra alias, región y fecha de registro de cada cuenta guardada.
 3. **Eliminar cuenta** — quita una cuenta de la lista visible (ver nota sobre soft-delete en [Base de datos](#base-de-datos)).
-4. **Completar tareas diarias** — para cada cuenta y cada juego: check-in diario, reclamar tareas del Mimo Viajero, y comprar moneda premium (Primogemas, Stellar Jades, Polychrome) con los puntos acumulados. La compra solo se intenta si hay stock y los puntos alcanzan: antes de comprar se consultan los puntos actuales y no se manda ninguna request que ya se sabe que va a fallar.
+4. **Completar tareas diarias** — para cada cuenta y cada juego: check-in diario, reclamar tareas del Mimo Viajero (en Genshin, tras una [configuración inicial](#mimo-viajero-configuración-inicial-y-dos-versiones)), y comprar moneda premium (Primogemas, Stellar Jades, Polychrome) con los puntos acumulados. La compra solo se intenta si hay stock y los puntos alcanzan: antes de comprar se consultan los puntos actuales y no se manda ninguna request que ya se sabe que va a fallar.
    - **Enter** ejecuta todo (todas las cuentas, todos sus juegos). **`e`** permite elegir: primero las cuentas (`1,3`, `1-3`) y luego, cuando le toca el turno a cada una, los juegos que detectó en ella (Enter = todos, números = solo esos, `0` o Ctrl+C = omitir la cuenta). Sirve para probar un solo juego o una sola cuenta sin tocar las demás.
 5. **Canjear código de regalo (manual)** — el usuario elige el juego, pega un código, y se canjea en todas las cuentas OS que tengan ese juego.
 6. **Agregar código de regalo a la base de datos** — guarda un código para que el sistema automático lo recuerde y lo canjee en cualquier cuenta futura sin volver a pedirlo.
@@ -264,6 +265,7 @@ Principios aplicados:
 - **Los rangos son generosos, no el mínimo que funciona.** Una llamada a la API es mucho más rápida que cargar una página web real con imágenes y JS — los delays de este proyecto incluyen ese tiempo de "carga de página" encima del tiempo de reacción humana pura.
 - **Todo delay declara explícitamente qué transición está simulando** (cambiar de cuenta, cambiar de juego, navegar de la pestaña de tareas a la de tienda del Mimo, etc.), usando un rango de `config.py` dedicado — nunca un número mágico local.
 - **El `device_id` es persistente** (se genera una vez en el login y se reutiliza en todos los requests de esa cuenta), no aleatorio en cada petición — simula un dispositivo físico constante en vez de uno que cambia todo el tiempo.
+- **No se manda una request que ya se sabe que va a fallar, ni se reintenta a ciegas** (criterio explícito del usuario del proyecto: los reintentos fallidos pueden llamar la atención de los servidores). Ejemplos ya aplicados: no se intenta comprar un artículo agotado o que ya alcanzó su límite, ni uno que cuesta más que los puntos actuales; si el Mimo no responde o (en Genshin) no está configurado, se omite la tienda en vez de repetir la misma request; un fallo de red durante el canje de códigos detiene el canje en lugar de insistir con el resto, y no se prueba un prefijo alterno del Mimo cuando uno falla. Las llamadas a los juegos solo se reintentan ante rate limit (429), con espera creciente.
 - **Preferimos que el proceso tarde más antes que arriesgar una cuenta** (filosofía explícita del usuario del proyecto, no una conjetura del desarrollo).
 
 Todos los rangos de delay viven en `config.py` (`DELAY_*`) y están documentados ahí con la razón de cada uno. Cada uno tiene, además, un test dedicado que verifica que se dispara con el rango correcto en el punto correcto del código (no solo "que exista algún delay en algún lado").
@@ -280,6 +282,48 @@ El wrapper soporta dos sistemas de cuentas completamente distintos: **OS** (HoYo
 
 Esto no es una limitación de la implementación: está verificado contra el propio `genshin.py` (que tampoco lo soporta para CN) y reflejado explícitamente en el código con `NotImplementedError` en los puntos correspondientes.
 
+## Mimo Viajero: configuración inicial y dos versiones
+
+El Mimo Viajero (*Traveling Mimo*) es un evento de **HoYoLAB**, no de los juegos: se completan misiones, se acumulan puntos y se canjean en una tienda (entre otras cosas, la moneda premium de cada juego). Solo existe en OS. La herramienta automatiza las tareas, el reclamo de puntos y la compra de moneda, pero hay dos cosas que conviene saber antes de usarlo.
+
+### 1. Puede requerir una configuración inicial (la haces tú, una vez por cuenta)
+
+El caso comprobado es **Genshin Impact**. Mientras la cuenta no haya configurado el evento en HoYoLAB, el `index` del Mimo responde con normalidad pero `task_list` y `exchange_list` devuelven `retcode -510001 "Parameter Error"` aunque la request sea correcta (con los mismos parámetros que envía `genshin.py`). El mensaje es engañoso: no es un error de parámetros.
+
+- **Cómo reconocerlo:** el resumen de la ejecución muestra *"El Mimo de Genshin no está configurado en esta cuenta..."* y el log trae `[APP] Mimo de Genshin sin configurar en esta cuenta`. El check-in de Genshin no se ve afectado. La herramienta no insiste con la tienda (una sola request fallida en vez de dos).
+- **Qué hacer:** con la cuenta de HoYoLAB que usas en la herramienta, abre la página del evento (tabla de abajo), completa la configuración que te pida y vuelve a ejecutar. Basta hacerlo una vez.
+- **Por qué no lo hace la herramienta:** no se conoce una API para ello (ni `genshin.py` ni hoyo-buddy la exponen; hoyo-buddy solo muestra el aviso con el enlace), y probar endpoints a ciegas contra los servidores de HoYoverse es justo lo que el proyecto evita (ver [Seguridad anti-baneo](#seguridad-anti-baneo)).
+- **HSR y ZZZ** no han necesitado este paso en las cuentas con las que se probó.
+
+Páginas del evento donde se puede configurar o consultar:
+
+| Mimo | Página | Fuente |
+|---|---|---|
+| **Genshin Impact** (versión nueva) | `https://act.hoyolab.com/ys/event/bbs-event-20251029points/index.html` | La usa hoyo-buddy para este mismo aviso (abril de 2026). Es la que muestra la herramienta (`config.MIMO_GENSHIN_SETUP_URL`). |
+| **Mimo original** (HSR y ZZZ; entrada general de HoYoLAB) | `https://act.hoyolab.com/bbs/event/bbs-event-20230908mimo/index.html` | Publicaciones oficiales de HoYoLAB de noviembre de 2023. Allí se enlaza con `?from=hoyolab&hyl_auth_required=true&...`; desde HSR, con `?from=hkrpg`. |
+
+Notas sobre esas páginas:
+
+- Están pensadas para abrirse con la sesión de HoYoLAB iniciada (el enlace oficial lleva `hyl_auth_required=true`). Si en el navegador no carga bien, prueba desde la app de HoYoLAB.
+- **Ninguna se pudo abrir desde el entorno de desarrollo** (necesitan JavaScript y sesión): las URLs salen de las fuentes indicadas, no de una comprobación propia. El identificador del evento (`20251029`, `20230908`) forma parte de la URL y **cambia con cada evento**; si una deja de funcionar, busca el banner del Mimo dentro de HoYoLAB y corrige `MIMO_GENSHIN_SETUP_URL` en `config.py`.
+- Según la publicación oficial, **los puntos hay que recogerlos** (los no recogidos caducan al refrescarse las misiones; la herramienta los reclama) y, desde 2024, **los puntos reclamados y sin gastar caducan el 31 de marzo, 30 de junio, 30 de septiembre y 31 de diciembre** (23:59, UTC+8). Es información de 2023: conviene confirmarla en las reglas vigentes del evento.
+
+### 2. Dos versiones del Mimo
+
+Genshin usa una versión del Mimo distinta de la de HSR y ZZZ. Comparten el host (`config.MIMO_BASE_URL`) y la idea (tareas, puntos, tienda), pero difieren en lo siguiente:
+
+| | Genshin Impact | Honkai: Star Rail y Zenless Zone Zero |
+|---|---|---|
+| Página del evento | `bbs-event-20251029points` (ruta `/ys/`) | `bbs-event-20230908mimo` (la original) |
+| Ruta de la API | `<MIMO_BASE_URL>/qiuqiu/<endpoint>`, con guiones bajos (`task_list`, `exchange_list`, `finish_task`, `receive_point`) | `<MIMO_BASE_URL>/<endpoint>`, con guiones (`task-list`, `exchange-list`, ...) |
+| Respuesta del `index` | `act_list[].act_info` | `list` |
+| Reclamar puntos (`receive-point`) | `POST` | `GET` |
+| Configuración inicial | **Necesaria** (`-510001` hasta hacerla) | No se ha necesitado |
+| Idioma de las requests | `en-us` (`config.MIMO_GENSHIN_LANG`) | `en` (`config.MIMO_LANG`) |
+| Moneda de la tienda | Primogems | Stellar Jades (HSR), Polychrome (ZZZ) |
+
+Todo lo que difiere está aislado en `HoyoWrapper/game_model.py` (`_mimo_url`, `_fetch_mimo_index`, `_mimo_lang`) y en `config.py`. El prefijo `qiuqiu` **lo rota HoYoverse**: hasta `genshin.py` 1.7.21 era `nata` y desde la 1.7.22 es `qiuqiu`; con el prefijo equivocado el `index` de Genshin responde `404`. `finish-task` y `exchange` son `POST` en los tres juegos.
+
 ## `config.py` — valores que cambian con el tiempo
 
 HoYoverse modifica endpoints, IDs de actividad y salts de firma sin previo aviso. Todo lo que puede cambiar así vive en un único archivo, separado de la lógica, para que corregirlo sea editar una constante en un solo lugar en vez de rastrear el valor por todo el código.
@@ -293,6 +337,7 @@ Categorías de valores en `config.py`:
 - **Salts de firma** (`DS_SALT_*`) y claves RSA de login.
 - **Retcodes conocidos**: de captcha, de credenciales, y los tres niveles de clasificación de canje de códigos.
 - **Rangos de delay anti-baneo** (`DELAY_*`).
+- **Mimo Viajero**: `MIMO_BASE_URL`, `MIMO_GENSHIN_PATH_PREFIX` (el prefijo de Genshin, que HoYoverse rota), `MIMO_GENSHIN_LANG` / `MIMO_LANG`, `MIMO_GENSHIN_SETUP_RETCODE` / `MIMO_GENSHIN_SETUP_URL` (configuración inicial), `MIMO_SHOP_STATUS_EXCHANGEABLE` y `CURRENCY_ITEM_KEYWORDS` (qué se compra en la tienda).
 - **Ruta de la base de datos** (`DB_PATH`).
 
 ## Instalación y uso
@@ -325,7 +370,7 @@ Estos principios están pensados para trasladarse a cualquier herramienta futura
 ## Limitaciones conocidas
 
 - **Honkai Impact 3rd**: check-in soportado; sin Mimo Viajero ni canje de códigos vía API (HoYoverse no los expone para este juego).
-- **Genshin Impact — Mimo Viajero**: cada cuenta debe configurar el evento **una vez** en HoYoLAB. Mientras no lo haga, las tareas y la tienda del Mimo de Genshin responden `-510001 Parameter Error` aunque la request sea correcta (el check-in no se ve afectado). La herramienta lo reconoce, muestra cómo resolverlo (el enlace está en `config.MIMO_GENSHIN_SETUP_URL`) y no insiste con la tienda. HSR y ZZZ no lo necesitan.
+- **Genshin Impact — Mimo Viajero**: cada cuenta debe configurar el evento **una vez** en HoYoLAB; mientras no lo haga, las tareas y la tienda responden `-510001`. La herramienta lo reconoce y lo explica. Detalles, URLs y diferencias con HSR/ZZZ en [Mimo Viajero: configuración inicial y dos versiones](#mimo-viajero-configuración-inicial-y-dos-versiones).
 - **Región CN**: sin Mimo Viajero ni canje de códigos (ver [Regiones OS y CN](#regiones-os-y-cn)). El check-in CN sí funciona, incluyendo la firma `ds` correspondiente.
 - **Tears of Themis**: no implementado todavía (ver [Roadmap](#roadmap)).
 - **Login por app sin validar en vivo todavía**: está portado de `genshin.py` y probado de punta a punta contra HoYoverse *simulado* (cifrado, firma, captcha v4/v3, verificación por email, persistencia), pero no contra el servidor real. Si falla, `OS_LOGIN_METHOD = "web"` vuelve al comportamiento anterior.
@@ -340,6 +385,8 @@ Cuando algo se rompe en vivo, el orden de diagnóstico recomendado es:
 2. Comparar el endpoint/valor sospechoso contra `genshin.py` **instalado de nuevo** (`pip install --upgrade genshin`), no contra una revisión anterior de este mismo proyecto ni contra la memoria de quien lo esté depurando — HoYoverse cambia cosas, y `genshin.py` recibe esos cambios antes de que se reflejen en cualquier documentación.
 3. Si el valor cambió, corregirlo en `config.py` (es, casi siempre, el único archivo que hace falta tocar).
 4. Correr `pytest` para confirmar que nada más se rompió.
+
+Si el fallo es del Mimo y solo afecta a un juego, revisa primero [Mimo Viajero: configuración inicial y dos versiones](#mimo-viajero-configuración-inicial-y-dos-versiones): un `404` en el `index` de Genshin apunta a un prefijo rotado, y un `-510001` en `task_list` / `exchange_list`, a una cuenta sin configurar.
 
 ## Roadmap
 

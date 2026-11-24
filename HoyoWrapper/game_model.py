@@ -103,9 +103,6 @@ _RETRY_KWARGS = dict(
     reraise=True,
 )
 
-# ---------------------------------------------------------------------------
-# Clase base
-# ---------------------------------------------------------------------------
 
 def _as_int(value: typing.Any) -> typing.Optional[int]:
     """int(value), o None si falta o no es un numero (campos de la API del Mimo)."""
@@ -114,6 +111,10 @@ def _as_int(value: typing.Any) -> typing.Optional[int]:
     except (TypeError, ValueError):
         return None
 
+
+# ---------------------------------------------------------------------------
+# Clase base
+# ---------------------------------------------------------------------------
 
 class BaseGame:
     """
