@@ -136,6 +136,7 @@ proyecto/
     ├── test_auth_manager.py
     ├── test_auth_app_login.py   Login por app, captcha v4/v3, medición
     ├── test_captcha_server.py
+    ├── test_code_provider.py    Proveedor inyectable del código de verificación por email
     ├── test_ds_utils.py
     ├── test_game_model.py
     └── test_app.py
@@ -165,6 +166,8 @@ Toda la lógica de login y de renovación de sesión. Para OS hay dos métodos, 
 
 ### `HoyoWrapper/captcha_server.py`
 Levanta un servidor HTTP local temporal, abre el navegador del usuario, sirve el widget Geetest v3, y espera a que se resuelva (automáticamente, en modo silencioso) antes de devolver el resultado al flujo de login. Incluye un delay humano antes de enviar el resultado resuelto.
+
+Aquí también vive el **punto de entrada del código de verificación del email**: `enter_code` (por consola, el comportamiento por defecto) y el contrato `CodeProvider`. `AuthManager` (y por tanto `HoyoManager(store, code_provider=...)`) acepta un proveedor distinto —por ejemplo, el de una interfaz web— y lo usa en los dos lugares donde el login pide el código; si no se inyecta ninguno, se usa la consola exactamente como antes. Solo cambia *cómo se obtiene* la respuesta: reenviar, cancelar y verificar siguen siendo lógica del login. Un proveedor que no cumpla el contrato falla al construirse, no a mitad de un login.
 
 ### `HoyoWrapper/session_manager.py`
 `HoyoManager` es la fachada pública del wrapper: `HoyoManager(store).login(email, password)` devuelve una `ActiveSession` con los juegos ya detectados y listos. `ActiveSession` filtra las cuentas de juego a solo las soportadas (`config.SUPPORTED_GAME_BIZ`) e instancia el objeto de juego correcto (`GenshinGame`, `StarRailGame`, etc.) para cada una.
@@ -235,7 +238,7 @@ El canje de códigos exige una cookie, `cookie_token_v2`, que **caduca**. Check-
 **El primer login de una cuenta en este dispositivo** pasa por dos pasos que conviene conocer:
 
 1. Un captcha (Geetest v4), que se resuelve en el navegador que se abre.
-2. Un código de verificación por email, porque HoYoverse trata a la app como un dispositivo nuevo. El código llega a tu correo y se escribe en la consola. Ahí mismo: `r` reenvía el código (una vez, con un captcha nuevo), Enter vacío cancela, y un código incorrecto se puede reintentar hasta 3 veces.
+2. Un código de verificación por email, porque HoYoverse trata a la app como un dispositivo nuevo. El código llega a tu correo y se escribe en la consola (o en el cuadro de la interfaz que lo pida: ver `CodeProvider` en `captcha_server.py`). Ahí mismo: `r` reenvía el código (una vez, con un captcha nuevo), Enter vacío cancela, y un código incorrecto se puede reintentar hasta 3 veces.
 
 Si HoYoverse responde que ya envió un código hace poco (`-3206`), no es un error: hay que usar ese código. Después del primer login el `device_id` se conserva y no se vuelve a pedir.
 
@@ -355,7 +358,7 @@ El programa crea/usa un archivo SQLite (por defecto `./hoyo_auth.db`, configurab
 pytest
 ```
 
-441 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
+463 tests, todos ejecutables en pocos segundos (ninguno hace red real — HTTP se intercepta con `aioresponses`, la base de datos usa SQLite en memoria real sin mockear). `tests/conftest.py` documenta, en su encabezado, los principios de testing que sostienen toda la suite:
 
 1. Un test verifica una regla de negocio, no un detalle de implementación.
 2. Los mensajes de assert explican qué se esperaba, qué se obtuvo, y por qué importa.

@@ -360,10 +360,38 @@ async def solve_geetest(
     return await _launch_webapp(mmt, lang=lang, api_server=api_server, port=port)
 
 
-async def enter_code(prompt: str = "Introduce el codigo de verificacion: ") -> str:
+class CodeProvider(typing.Protocol):
     """
-    Solicita al usuario un codigo de verificacion por consola.
-    Es async para no bloquear el event loop.
+    Contrato de quien le pide al usuario el codigo de verificacion del email
+    durante un login. La consola (`enter_code`) es la implementacion por
+    defecto; una interfaz distinta (ej. web) inyecta la suya via
+    AuthManager / HoyoManager(code_provider=...).
+
+    prompt           texto a mostrar; ya trae las instrucciones para una consola.
+    resend_keyword   si no es None, el login admite reenviar el codigo: el
+                     proveedor debe devolver exactamente ese texto cuando el
+                     usuario pide reenviar. None = no se ofrece reenvio.
+
+    Devuelve lo que el usuario escribio. Una cadena vacia (o None) significa
+    "cancelar"; la logica de login decide que hacer con cada respuesta.
+    """
+
+    async def __call__(
+        self, prompt: str, *, resend_keyword: typing.Optional[str] = None,
+    ) -> typing.Optional[str]: ...
+
+
+async def enter_code(
+    prompt: str = "Introduce el codigo de verificacion: ",
+    *,
+    resend_keyword: typing.Optional[str] = None,
+) -> str:
+    """
+    Solicita al usuario un codigo de verificacion por consola (CodeProvider por
+    defecto). Es async para no bloquear el event loop.
+
+    `resend_keyword` se acepta por contrato pero aqui no hace falta: el prompt
+    de consola ya explica como reenviar.
     """
     logger.debug("[CAPTCHA] Esperando codigo de verificacion del usuario...")
     code = await asyncio.to_thread(input, prompt)

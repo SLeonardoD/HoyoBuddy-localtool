@@ -17,6 +17,7 @@ No contiene logica de DB. CookieStore se recibe por inyeccion.
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import random
 import string
@@ -30,7 +31,7 @@ import config
 from HoyoWrapper import ds_utils
 from HoyoWrapper.timing import random_delay
 from HoyoWrapper.captcha_server import (
-    SessionMMT, SessionMMTResult, SessionMMTv4, SessionMMTv4Result,
+    CodeProvider, SessionMMT, SessionMMTResult, SessionMMTv4, SessionMMTv4Result,
     enter_code, solve_geetest, solve_geetest_v4,
 )
 from HoyoWrapper.session import HoyoAPIError, HoyoSession, LoginError
@@ -154,6 +155,31 @@ class _CookieStoreProtocol(typing.Protocol):
     def delete(self, email: str) -> None: ...
 
 
+def _check_code_provider(provider: typing.Any) -> None:
+    """
+    Falla al CONSTRUIR (no a mitad de un login) si el proveedor no cumple el
+    contrato de captcha_server.CodeProvider: ser invocable y aceptar el
+    argumento `resend_keyword` (o **kwargs).
+    """
+    if not callable(provider):
+        raise TypeError(f"code_provider debe ser invocable, no {type(provider).__name__}.")
+    try:
+        params = inspect.signature(provider).parameters.values()
+    except (TypeError, ValueError):
+        return      # invocable que no se puede inspeccionar: se confia
+    accepts = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        or (p.name == "resend_keyword" and p.kind is not inspect.Parameter.POSITIONAL_ONLY
+            and p.kind is not inspect.Parameter.VAR_POSITIONAL)
+        for p in params
+    )
+    if not accepts:
+        raise TypeError(
+            "code_provider debe aceptar el argumento 'resend_keyword' "
+            "(async def proveedor(prompt, *, resend_keyword=None) -> str)."
+        )
+
+
 class AuthManager:
     """
     Gestor de autenticacion con HoYoLab / Miyoushe.
@@ -162,6 +188,9 @@ class AuthManager:
         store           CookieStore inyectado externamente.
         captcha_port    Puerto local del servidor de captcha.
         lang            Idioma del widget Geetest.
+        code_provider   Como se le pide al usuario el codigo de verificacion
+                        del email (ver captcha_server.CodeProvider). None = por
+                        consola (enter_code), el comportamiento de siempre.
     """
 
     def __init__(
@@ -169,10 +198,40 @@ class AuthManager:
         store: _CookieStoreProtocol,
         captcha_port: int = config.CAPTCHA_PORT_DEFAULT,
         lang: str = config.CAPTCHA_LANG_OS,
+        code_provider: typing.Optional[CodeProvider] = None,
     ) -> None:
+        if code_provider is not None:
+            _check_code_provider(code_provider)
         self._store = store
         self._captcha_port = captcha_port
         self._lang = lang
+        self._code_provider = code_provider
+
+    async def _ask_code(
+        self, prompt: str, *, resend_keyword: typing.Optional[str] = None,
+    ) -> str:
+        """
+        Pide el codigo de verificacion al usuario con el proveedor inyectado, o
+        por consola si no hay. Es el UNICO punto por donde el login interactua
+        con una persona para esto: lo que se haga con la respuesta (verificar,
+        reenviar, cancelar) sigue siendo logica del login.
+
+        Sin proveedor se usa `enter_code` buscandolo en el modulo en el
+        momento de la llamada (no al construir), como siempre.
+        """
+        if self._code_provider is None:
+            return await enter_code(prompt, resend_keyword=resend_keyword)
+
+        answer = await self._code_provider(prompt, resend_keyword=resend_keyword)
+        if answer is None:
+            answer = ""     # None = el usuario cancelo (ej. cerro el cuadro)
+        if not isinstance(answer, str):
+            raise TypeError(
+                "El code_provider debe devolver str (o None para cancelar); "
+                f"devolvio {type(answer).__name__}."
+            )
+        logger.debug("[AUTH] Codigo recibido del code_provider (longitud={}).", len(answer))
+        return answer
 
     # ------------------------------------------------------------------
     # API publica
@@ -515,8 +574,9 @@ class AuthManager:
 
     async def _verify_email_app(self, ticket: str, risk_ticket: str) -> None:
         """
-        Modo app: pide el codigo por email, lo recibe del usuario por consola y
-        se lo manda a HoYoverse. Vuelve cuando el codigo fue aceptado.
+        Modo app: pide el codigo por email, lo recibe del usuario (por consola,
+        o por el code_provider inyectado) y se lo manda a HoYoverse. Vuelve
+        cuando el codigo fue aceptado.
 
         En el prompt: el codigo para verificarlo, 'r' para reenviarlo (una vez,
         con un captcha nuevo) y Enter vacio para cancelar. Un codigo
@@ -530,7 +590,7 @@ class AuthManager:
         wrong_codes = resends = 0
 
         while True:
-            answer = (await enter_code(prompt)).strip()
+            answer = (await self._ask_code(prompt, resend_keyword=keyword)).strip()
 
             if not answer:
                 raise LoginError("Verificacion por email cancelada por el usuario.")
@@ -1128,7 +1188,7 @@ class AuthManager:
                 ticket_str, headers=headers, base_headers=None,
             )
 
-            code = await enter_code("Introduce el codigo de verificacion enviado a tu email: ")
+            code = await self._ask_code("Introduce el codigo de verificacion enviado a tu email: ")
             logger.debug("[AUTH] Codigo introducido por el usuario. Verificando...")
 
             await self._verify_email_code(

@@ -27,6 +27,7 @@ import typing
 
 import config
 from HoyoWrapper.auth_manager import AuthManager
+from HoyoWrapper.captcha_server import CodeProvider
 from HoyoWrapper.game_model import BaseGame, create_game, random_delay
 from HoyoWrapper.session import HoyoAPIError, HoyoSession, LoginError
 
@@ -126,6 +127,9 @@ class HoyoManager:
         store           CookieStore (inyectado — este objeto no crea la DB).
         captcha_port    Puerto local del servidor de captcha. Por defecto 5000.
         lang            Idioma del widget Geetest. Por defecto 'en'.
+        code_provider   Como se le pide al usuario el codigo de verificacion del
+                        email durante un login (ver captcha_server.CodeProvider).
+                        None = por consola, como siempre.
 
     Uso:
         from db import CookieStore
@@ -140,8 +144,11 @@ class HoyoManager:
         store: typing.Any,          # CookieStore o compatible
         captcha_port: int = config.CAPTCHA_PORT_DEFAULT,
         lang: str = config.CAPTCHA_LANG_OS,
+        code_provider: typing.Optional[CodeProvider] = None,
     ) -> None:
-        self._auth = AuthManager(store, captcha_port=captcha_port, lang=lang)
+        self._auth = AuthManager(
+            store, captcha_port=captcha_port, lang=lang, code_provider=code_provider,
+        )
 
     async def login(
         self,
